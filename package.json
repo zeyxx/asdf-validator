@@ -1,0 +1,46 @@
+{
+  "name": "asdf-validator",
+  "version": "0.1.0",
+  "description": "Track creator fees for Pump.fun tokens",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "asdf-validator": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "solana",
+    "pump.fun",
+    "pumpfun",
+    "validator",
+    "fee-tracker",
+    "creator-fees",
+    "asdf"
+  ],
+  "author": "ASDF Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zeyxx/asdf-validator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zeyxx/asdf-validator/issues"
+  },
+  "homepage": "https://github.com/zeyxx/asdf-validator#readme",
+  "peerDependencies": {
+    "@solana/web3.js": "^1.87.0"
+  },
+  "devDependencies": {
+    "@solana/web3.js": "^1.87.0",
+    "typescript": "^5.0.0"
+  }
+}

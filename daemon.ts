@@ -29,11 +29,8 @@ import { Connection, PublicKey } from '@solana/web3.js';
 /** PumpFun Program ID */
 export const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 
-/** PumpSwap AMM Program ID */
+/** PumpSwap AMM Program ID (same vault as bonding curve) */
 export const PUMPSWAP_PROGRAM_ID = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
-
-/** WSOL Mint */
-const WSOL_MINT = new PublicKey('So11111111111111111111111111111111111111112');
 
 // ============================================================================
 // Types
@@ -95,10 +92,11 @@ export interface DaemonConfig {
 // ============================================================================
 
 /**
- * Derive creator vault address for PumpFun bonding curve
- * Seeds: ["creator-vault", creator] (with hyphen)
+ * Derive creator vault address for Pump.fun
+ * Note: BC and AMM use the same vault address on-chain
+ * Seeds: ["creator-vault", creator]
  */
-export function deriveBondingCurveVault(creator: PublicKey): PublicKey {
+export function deriveCreatorVault(creator: PublicKey): PublicKey {
   const [vault] = PublicKey.findProgramAddressSync(
     [Buffer.from('creator-vault'), creator.toBuffer()],
     PUMP_PROGRAM_ID
@@ -106,17 +104,9 @@ export function deriveBondingCurveVault(creator: PublicKey): PublicKey {
   return vault;
 }
 
-/**
- * Derive creator vault address for PumpSwap AMM
- * Seeds: ["creator_vault", creator] (with underscore)
- */
-export function derivePumpSwapVault(creator: PublicKey): PublicKey {
-  const [vault] = PublicKey.findProgramAddressSync(
-    [Buffer.from('creator_vault'), creator.toBuffer()],
-    PUMPSWAP_PROGRAM_ID
-  );
-  return vault;
-}
+// Aliases for backward compatibility
+export const deriveBondingCurveVault = deriveCreatorVault;
+export const derivePumpSwapVault = deriveCreatorVault;
 
 // ============================================================================
 // Validator Daemon
@@ -131,10 +121,8 @@ export class ValidatorDaemon {
   private tokens: Map<string, TokenConfig>;
   private tokenStats: Map<string, TokenStats>;
 
-  private bcVault: PublicKey;
-  private ammVault: PublicKey;
-  private lastBcBalance: bigint = 0n;
-  private lastAmmBalance: bigint = 0n;
+  private creatorVault: PublicKey;
+  private lastVaultBalance: bigint = 0n;
 
   private pollInterval: number;
   private statsInterval: number;
@@ -153,9 +141,8 @@ export class ValidatorDaemon {
     this.tokens = new Map();
     this.tokenStats = new Map();
 
-    // Derive vault addresses
-    this.bcVault = deriveBondingCurveVault(this.creator);
-    this.ammVault = derivePumpSwapVault(this.creator);
+    // Derive creator vault (same for BC and AMM)
+    this.creatorVault = deriveCreatorVault(this.creator);
 
     // Load tokens if provided
     if (config.tokens) {
@@ -224,8 +211,7 @@ export class ValidatorDaemon {
     this.running = true;
     this.log('Starting validator daemon...');
     this.log(`Creator: ${this.creator.toBase58()}`);
-    this.log(`BC Vault: ${this.bcVault.toBase58()}`);
-    this.log(`AMM Vault: ${this.ammVault.toBase58()}`);
+    this.log(`Vault: ${this.creatorVault.toBase58()}`);
     this.log(`Tokens: ${this.tokens.size}`);
     this.log(`Poll interval: ${this.pollInterval}ms`);
 
@@ -279,98 +265,50 @@ export class ValidatorDaemon {
 
   private async initializeBalances(): Promise<void> {
     try {
-      // Get bonding curve vault balance (native SOL)
-      this.lastBcBalance = BigInt(await this.connection.getBalance(this.bcVault));
-      this.log(`BC vault initial: ${Number(this.lastBcBalance) / 1e9} SOL`);
+      this.lastVaultBalance = BigInt(await this.connection.getBalance(this.creatorVault));
+      this.log(`Vault initial: ${Number(this.lastVaultBalance) / 1e9} SOL`);
     } catch {
-      this.lastBcBalance = 0n;
-    }
-
-    try {
-      // Get AMM vault balance (WSOL token account)
-      const ammAccount = await this.connection.getTokenAccountBalance(this.ammVault);
-      this.lastAmmBalance = BigInt(ammAccount.value.amount);
-      this.log(`AMM vault initial: ${Number(this.lastAmmBalance) / 1e9} WSOL`);
-    } catch {
-      this.lastAmmBalance = 0n;
+      this.lastVaultBalance = 0n;
     }
   }
 
   private async poll(): Promise<void> {
-    const slot = await this.connection.getSlot();
-    const timestamp = Date.now();
-
-    // Poll bonding curve vault
-    await this.pollVault('bonding_curve', this.bcVault, slot, timestamp);
-
-    // Poll AMM vault
-    await this.pollVault('pumpswap_amm', this.ammVault, slot, timestamp);
-  }
-
-  private async pollVault(
-    poolType: PoolType,
-    vault: PublicKey,
-    slot: number,
-    timestamp: number
-  ): Promise<void> {
     try {
-      let currentBalance: bigint;
-      let lastBalance: bigint;
-
-      if (poolType === 'bonding_curve') {
-        currentBalance = BigInt(await this.connection.getBalance(vault));
-        lastBalance = this.lastBcBalance;
-      } else {
-        try {
-          const account = await this.connection.getTokenAccountBalance(vault);
-          currentBalance = BigInt(account.value.amount);
-        } catch {
-          currentBalance = 0n;
-        }
-        lastBalance = this.lastAmmBalance;
-      }
-
-      const delta = currentBalance - lastBalance;
+      const slot = await this.connection.getSlot();
+      const timestamp = Date.now();
+      const currentBalance = BigInt(await this.connection.getBalance(this.creatorVault));
+      const delta = currentBalance - this.lastVaultBalance;
 
       if (delta > 0n) {
-        // Fees detected!
-        this.handleFeeDetected(poolType, delta, slot, timestamp);
+        this.handleFeeDetected(delta, slot, timestamp);
       }
 
-      // Update last known balance
-      if (poolType === 'bonding_curve') {
-        this.lastBcBalance = currentBalance;
-      } else {
-        this.lastAmmBalance = currentBalance;
-      }
+      this.lastVaultBalance = currentBalance;
     } catch (error) {
       if (this.verbose) {
-        console.error(`Poll error (${poolType}):`, error);
+        console.error('Poll error:', error);
       }
     }
   }
 
   private handleFeeDetected(
-    poolType: PoolType,
     amount: bigint,
     slot: number,
     timestamp: number
   ): void {
-    // Find matching token(s) for this pool type
-    const matchingTokens = Array.from(this.tokens.values())
-      .filter(t => t.poolType === poolType);
+    const tokens = Array.from(this.tokens.values());
 
-    if (matchingTokens.length === 0) {
-      // No specific token configured, attribute to "unknown"
+    if (tokens.length === 0) {
+      // No specific token configured
       const record: FeeRecord = {
         mint: 'unknown',
-        symbol: poolType === 'bonding_curve' ? 'BC' : 'AMM',
+        symbol: 'VAULT',
         amount,
         timestamp,
         slot,
       };
 
-      this.log(`Fee detected: +${Number(amount) / 1e9} SOL (${poolType})`);
+      this.log(`Fee detected: +${Number(amount) / 1e9} SOL`);
 
       if (this.onFeeDetected) {
         this.onFeeDetected(record);
@@ -378,16 +316,21 @@ export class ValidatorDaemon {
       return;
     }
 
-    if (matchingTokens.length === 1) {
-      // Single token - attribute all fees to it
-      const token = matchingTokens[0];
-      this.attributeFee(token, amount, slot, timestamp);
+    if (tokens.length === 1) {
+      this.attributeFee(tokens[0], amount, slot, timestamp);
     } else {
-      // Multiple tokens - split equally (or implement custom logic)
-      // For now, attribute to first token and log warning
-      this.log(`Warning: ${matchingTokens.length} tokens share ${poolType} vault`);
-      const token = matchingTokens[0];
-      this.attributeFee(token, amount, slot, timestamp);
+      // Multiple tokens share vault - attribute to generic
+      this.log(`Warning: ${tokens.length} tokens share vault`);
+      const record: FeeRecord = {
+        mint: 'shared',
+        symbol: 'SHARED',
+        amount,
+        timestamp,
+        slot,
+      };
+      if (this.onFeeDetected) {
+        this.onFeeDetected(record);
+      }
     }
   }
 

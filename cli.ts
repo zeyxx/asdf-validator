@@ -9,7 +9,7 @@
  *   asdf-validator -c <ADDRESS> --verbose
  */
 
-import { ValidatorDaemon, TokenConfig, deriveCreatorVault } from './daemon';
+import { ValidatorDaemon, TokenConfig, deriveBondingCurveVault, derivePumpSwapVault } from './daemon';
 import { PublicKey, Connection } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -167,13 +167,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Derive vault address for display
-  const vault = deriveCreatorVault(creator);
+  // Derive vault addresses for display
+  const bcVault = deriveBondingCurveVault(creator);
+  const ammVault = derivePumpSwapVault(creator);
 
   console.log('\n🔥 ASDF VALIDATOR DAEMON');
   console.log('═'.repeat(55));
   console.log(`Creator:    ${creator.toBase58()}`);
-  console.log(`Vault:      ${vault.toBase58()}`);
+  console.log(`BC Vault:   ${bcVault.toBase58()}`);
+  console.log(`AMM Vault:  ${ammVault.toBase58()}`);
   console.log(`RPC:        ${args.rpcUrl.slice(0, 50)}...`);
   console.log(`Poll:       ${args.pollInterval / 1000}s`);
   console.log('═'.repeat(55));

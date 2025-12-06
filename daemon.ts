@@ -92,11 +92,10 @@ export interface DaemonConfig {
 // ============================================================================
 
 /**
- * Derive creator vault address for Pump.fun
- * Note: BC and AMM use the same vault address on-chain
- * Seeds: ["creator-vault", creator]
+ * Derive creator vault for PumpFun Bonding Curve
+ * Seeds: ["creator-vault", creator] (hyphen)
  */
-export function deriveCreatorVault(creator: PublicKey): PublicKey {
+export function deriveBondingCurveVault(creator: PublicKey): PublicKey {
   const [vault] = PublicKey.findProgramAddressSync(
     [Buffer.from('creator-vault'), creator.toBuffer()],
     PUMP_PROGRAM_ID
@@ -104,9 +103,17 @@ export function deriveCreatorVault(creator: PublicKey): PublicKey {
   return vault;
 }
 
-// Aliases for backward compatibility
-export const deriveBondingCurveVault = deriveCreatorVault;
-export const derivePumpSwapVault = deriveCreatorVault;
+/**
+ * Derive creator vault for PumpSwap AMM
+ * Seeds: ["creator_vault", creator] (underscore)
+ */
+export function derivePumpSwapVault(creator: PublicKey): PublicKey {
+  const [vault] = PublicKey.findProgramAddressSync(
+    [Buffer.from('creator_vault'), creator.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  );
+  return vault;
+}
 
 // ============================================================================
 // Validator Daemon
@@ -121,8 +128,10 @@ export class ValidatorDaemon {
   private tokens: Map<string, TokenConfig>;
   private tokenStats: Map<string, TokenStats>;
 
-  private creatorVault: PublicKey;
-  private lastVaultBalance: bigint = 0n;
+  private bcVault: PublicKey;
+  private ammVault: PublicKey;
+  private lastBcBalance: bigint = 0n;
+  private lastAmmBalance: bigint = 0n;
 
   private pollInterval: number;
   private statsInterval: number;
@@ -141,8 +150,9 @@ export class ValidatorDaemon {
     this.tokens = new Map();
     this.tokenStats = new Map();
 
-    // Derive creator vault (same for BC and AMM)
-    this.creatorVault = deriveCreatorVault(this.creator);
+    // Derive both vault addresses
+    this.bcVault = deriveBondingCurveVault(this.creator);
+    this.ammVault = derivePumpSwapVault(this.creator);
 
     // Load tokens if provided
     if (config.tokens) {
@@ -211,7 +221,8 @@ export class ValidatorDaemon {
     this.running = true;
     this.log('Starting validator daemon...');
     this.log(`Creator: ${this.creator.toBase58()}`);
-    this.log(`Vault: ${this.creatorVault.toBase58()}`);
+    this.log(`BC Vault: ${this.bcVault.toBase58()}`);
+    this.log(`AMM Vault: ${this.ammVault.toBase58()}`);
     this.log(`Tokens: ${this.tokens.size}`);
     this.log(`Poll interval: ${this.pollInterval}ms`);
 
@@ -265,72 +276,73 @@ export class ValidatorDaemon {
 
   private async initializeBalances(): Promise<void> {
     try {
-      this.lastVaultBalance = BigInt(await this.connection.getBalance(this.creatorVault));
-      this.log(`Vault initial: ${Number(this.lastVaultBalance) / 1e9} SOL`);
+      this.lastBcBalance = BigInt(await this.connection.getBalance(this.bcVault));
+      this.log(`BC vault initial: ${Number(this.lastBcBalance) / 1e9} SOL`);
     } catch {
-      this.lastVaultBalance = 0n;
+      this.lastBcBalance = 0n;
+    }
+
+    try {
+      this.lastAmmBalance = BigInt(await this.connection.getBalance(this.ammVault));
+      this.log(`AMM vault initial: ${Number(this.lastAmmBalance) / 1e9} SOL`);
+    } catch {
+      this.lastAmmBalance = 0n;
     }
   }
 
   private async poll(): Promise<void> {
+    const slot = await this.connection.getSlot();
+    const timestamp = Date.now();
+
+    // Poll BC vault
+    await this.pollVault('BC', this.bcVault, slot, timestamp, 'lastBcBalance');
+
+    // Poll AMM vault
+    await this.pollVault('AMM', this.ammVault, slot, timestamp, 'lastAmmBalance');
+  }
+
+  private async pollVault(
+    vaultType: string,
+    vault: PublicKey,
+    slot: number,
+    timestamp: number,
+    balanceKey: 'lastBcBalance' | 'lastAmmBalance'
+  ): Promise<void> {
     try {
-      const slot = await this.connection.getSlot();
-      const timestamp = Date.now();
-      const currentBalance = BigInt(await this.connection.getBalance(this.creatorVault));
-      const delta = currentBalance - this.lastVaultBalance;
+      const currentBalance = BigInt(await this.connection.getBalance(vault));
+      const lastBalance = this[balanceKey];
+      const delta = currentBalance - lastBalance;
 
       if (delta > 0n) {
-        this.handleFeeDetected(delta, slot, timestamp);
+        this.handleFeeDetected(vaultType, delta, slot, timestamp);
       }
 
-      this.lastVaultBalance = currentBalance;
+      this[balanceKey] = currentBalance;
     } catch (error) {
       if (this.verbose) {
-        console.error('Poll error:', error);
+        console.error(`Poll error (${vaultType}):`, error);
       }
     }
   }
 
   private handleFeeDetected(
+    vaultType: string,
     amount: bigint,
     slot: number,
     timestamp: number
   ): void {
-    const tokens = Array.from(this.tokens.values());
+    const record: FeeRecord = {
+      mint: 'unknown',
+      symbol: vaultType,
+      amount,
+      timestamp,
+      slot,
+    };
 
-    if (tokens.length === 0) {
-      // No specific token configured
-      const record: FeeRecord = {
-        mint: 'unknown',
-        symbol: 'VAULT',
-        amount,
-        timestamp,
-        slot,
-      };
+    this.log(`${vaultType}: +${Number(amount) / 1e9} SOL`);
 
-      this.log(`Fee detected: +${Number(amount) / 1e9} SOL`);
-
-      if (this.onFeeDetected) {
-        this.onFeeDetected(record);
-      }
-      return;
-    }
-
-    if (tokens.length === 1) {
-      this.attributeFee(tokens[0], amount, slot, timestamp);
-    } else {
-      // Multiple tokens share vault - attribute to generic
-      this.log(`Warning: ${tokens.length} tokens share vault`);
-      const record: FeeRecord = {
-        mint: 'shared',
-        symbol: 'SHARED',
-        amount,
-        timestamp,
-        slot,
-      };
-      if (this.onFeeDetected) {
-        this.onFeeDetected(record);
-      }
+    if (this.onFeeDetected) {
+      this.onFeeDetected(record);
     }
   }
 

@@ -21,6 +21,9 @@
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
+import { createHash } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // ============================================================================
 // Constants
@@ -61,6 +64,75 @@ export interface TokenStats {
   lastFeeTimestamp: number;
 }
 
+// ============================================================================
+// Proof-of-History Types
+// ============================================================================
+
+/** Genesis block hash - SHA256("ASDF_VALIDATOR_GENESIS") */
+export const GENESIS_HASH = 'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456';
+
+/**
+ * Event type for history entries
+ */
+export type HistoryEventType = 'FEE' | 'CLAIM';
+
+/**
+ * Proof-of-History entry for verifiable fee tracking
+ * Each entry is chained to the previous via prevHash
+ */
+export interface HistoryEntry {
+  /** Sequence number (0 = genesis) */
+  sequence: number;
+  /** Hash of previous entry (genesis for first) */
+  prevHash: string;
+  /** SHA-256 hash of this entry's data */
+  hash: string;
+  /** Event type: FEE (incoming) or CLAIM (withdrawal) */
+  eventType: HistoryEventType;
+  /** Vault type: BC or AMM */
+  vaultType: 'BC' | 'AMM';
+  /** Vault address */
+  vault: string;
+  /** Amount in lamports (positive for FEE, negative for CLAIM) */
+  amount: string;
+  /** Balance before this event */
+  balanceBefore: string;
+  /** Balance after this event */
+  balanceAfter: string;
+  /** Solana slot number */
+  slot: number;
+  /** Unix timestamp (ms) */
+  timestamp: number;
+  /** ISO date string for readability */
+  date: string;
+}
+
+/**
+ * Full proof-of-history log with metadata
+ */
+export interface HistoryLog {
+  /** Version of the proof-of-history format */
+  version: string;
+  /** Creator address being tracked */
+  creator: string;
+  /** BC vault address */
+  bcVault: string;
+  /** AMM vault address */
+  ammVault: string;
+  /** When tracking started */
+  startedAt: string;
+  /** Last update time */
+  lastUpdated: string;
+  /** Total fees tracked (lamports) */
+  totalFees: string;
+  /** Number of fee events */
+  entryCount: number;
+  /** Hash of latest entry */
+  latestHash: string;
+  /** All history entries */
+  entries: HistoryEntry[];
+}
+
 export interface DaemonConfig {
   /** Solana RPC URL */
   rpcUrl: string;
@@ -85,6 +157,126 @@ export interface DaemonConfig {
 
   /** Enable verbose logging */
   verbose?: boolean;
+
+  /** Path to proof-of-history JSON file (enables PoH tracking) */
+  historyFile?: string;
+
+  /** Callback when history entry is added */
+  onHistoryEntry?: (entry: HistoryEntry) => void;
+}
+
+// ============================================================================
+// Proof-of-History Functions
+// ============================================================================
+
+/**
+ * Compute SHA-256 hash of entry data (excluding the hash field itself)
+ */
+export function computeEntryHash(entry: Omit<HistoryEntry, 'hash'>): string {
+  const data = [
+    entry.sequence.toString(),
+    entry.prevHash,
+    entry.eventType,
+    entry.vaultType,
+    entry.vault,
+    entry.amount,
+    entry.balanceBefore,
+    entry.balanceAfter,
+    entry.slot.toString(),
+    entry.timestamp.toString(),
+  ].join('|');
+
+  return createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Verify a single history entry's hash
+ */
+export function verifyEntryHash(entry: HistoryEntry): boolean {
+  const computed = computeEntryHash(entry);
+  return computed === entry.hash;
+}
+
+/**
+ * Verify the entire proof-of-history chain
+ * Returns { valid: true } or { valid: false, error: string, entryIndex: number }
+ */
+export function verifyHistoryChain(log: HistoryLog): { valid: boolean; error?: string; entryIndex?: number } {
+  if (log.entries.length === 0) {
+    return { valid: true };
+  }
+
+  // Verify first entry links to genesis
+  if (log.entries[0].prevHash !== GENESIS_HASH) {
+    return { valid: false, error: 'First entry does not link to genesis hash', entryIndex: 0 };
+  }
+
+  // Verify each entry
+  for (let i = 0; i < log.entries.length; i++) {
+    const entry = log.entries[i];
+
+    // Verify sequence number
+    if (entry.sequence !== i + 1) {
+      return { valid: false, error: `Invalid sequence number: expected ${i + 1}, got ${entry.sequence}`, entryIndex: i };
+    }
+
+    // Verify hash
+    if (!verifyEntryHash(entry)) {
+      return { valid: false, error: `Invalid hash at entry ${i + 1}`, entryIndex: i };
+    }
+
+    // Verify chain linkage (except first entry)
+    if (i > 0 && entry.prevHash !== log.entries[i - 1].hash) {
+      return { valid: false, error: `Broken chain at entry ${i + 1}: prevHash does not match previous entry`, entryIndex: i };
+    }
+  }
+
+  // Verify latest hash matches
+  const lastEntry = log.entries[log.entries.length - 1];
+  if (log.latestHash !== lastEntry.hash) {
+    return { valid: false, error: 'latestHash does not match last entry hash', entryIndex: log.entries.length - 1 };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Load existing history log or create new one
+ */
+export function loadHistoryLog(filePath: string, creator: string, bcVault: string, ammVault: string): HistoryLog {
+  try {
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      return JSON.parse(content) as HistoryLog;
+    }
+  } catch (error) {
+    console.error(`Warning: Could not load history file, creating new: ${error}`);
+  }
+
+  // Create new history log
+  return {
+    version: '1.0.0',
+    creator,
+    bcVault,
+    ammVault,
+    startedAt: new Date().toISOString(),
+    lastUpdated: new Date().toISOString(),
+    totalFees: '0',
+    entryCount: 0,
+    latestHash: GENESIS_HASH,
+    entries: [],
+  };
+}
+
+/**
+ * Save history log to file
+ */
+export function saveHistoryLog(filePath: string, log: HistoryLog): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(filePath, JSON.stringify(log, null, 2));
 }
 
 // ============================================================================
@@ -139,10 +331,15 @@ export class ValidatorDaemon {
 
   private onFeeDetected?: (record: FeeRecord) => void;
   private onStats?: (stats: TokenStats[]) => void;
+  private onHistoryEntry?: (entry: HistoryEntry) => void;
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+
+  // Proof-of-History
+  private historyFile?: string;
+  private historyLog?: HistoryLog;
 
   constructor(config: DaemonConfig) {
     this.connection = new Connection(config.rpcUrl, 'confirmed');
@@ -173,6 +370,18 @@ export class ValidatorDaemon {
     this.verbose = config.verbose || false;
     this.onFeeDetected = config.onFeeDetected;
     this.onStats = config.onStats;
+    this.onHistoryEntry = config.onHistoryEntry;
+
+    // Initialize Proof-of-History if file path provided
+    this.historyFile = config.historyFile;
+    if (this.historyFile) {
+      this.historyLog = loadHistoryLog(
+        this.historyFile,
+        this.creator.toBase58(),
+        this.bcVault.toBase58(),
+        this.ammVault.toBase58()
+      );
+    }
   }
 
   /**
@@ -207,6 +416,30 @@ export class ValidatorDaemon {
       total += stats.totalFees;
     }
     return total;
+  }
+
+  /**
+   * Get the proof-of-history log (if enabled)
+   */
+  getHistoryLog(): HistoryLog | undefined {
+    return this.historyLog;
+  }
+
+  /**
+   * Verify the proof-of-history chain integrity
+   */
+  verifyHistory(): { valid: boolean; error?: string; entryIndex?: number } {
+    if (!this.historyLog) {
+      return { valid: false, error: 'Proof-of-History not enabled' };
+    }
+    return verifyHistoryChain(this.historyLog);
+  }
+
+  /**
+   * Get history file path
+   */
+  getHistoryFilePath(): string | undefined {
+    return this.historyFile;
   }
 
   /**
@@ -302,7 +535,7 @@ export class ValidatorDaemon {
   }
 
   private async pollVault(
-    vaultType: string,
+    vaultType: 'BC' | 'AMM',
     vault: PublicKey,
     slot: number,
     timestamp: number,
@@ -314,7 +547,11 @@ export class ValidatorDaemon {
       const delta = currentBalance - lastBalance;
 
       if (delta > 0n) {
-        this.handleFeeDetected(vaultType, delta, slot, timestamp);
+        // Fee incoming
+        this.handleBalanceChange('FEE', vaultType, vault, delta, lastBalance, currentBalance, slot, timestamp);
+      } else if (delta < 0n) {
+        // Claim detected (withdrawal)
+        this.handleBalanceChange('CLAIM', vaultType, vault, delta, lastBalance, currentBalance, slot, timestamp);
       }
 
       this[balanceKey] = currentBalance;
@@ -325,23 +562,94 @@ export class ValidatorDaemon {
     }
   }
 
-  private handleFeeDetected(
-    vaultType: string,
+  private handleBalanceChange(
+    eventType: HistoryEventType,
+    vaultType: 'BC' | 'AMM',
+    vault: PublicKey,
     amount: bigint,
+    balanceBefore: bigint,
+    balanceAfter: bigint,
     slot: number,
     timestamp: number
   ): void {
-    const record: FeeRecord = {
-      mint: 'unknown',
-      symbol: vaultType,
-      amount,
-      timestamp,
-      slot,
-    };
+    const absAmount = amount < 0n ? -amount : amount;
 
-    this.log(`${vaultType}: +${Number(amount) / 1e9} SOL`);
+    // Only update stats for FEE events (not claims)
+    if (eventType === 'FEE') {
+      let stats = this.tokenStats.get(vaultType);
+      if (!stats) {
+        stats = {
+          mint: vaultType,
+          symbol: vaultType,
+          totalFees: 0n,
+          feeCount: 0,
+          lastFeeTimestamp: 0,
+        };
+        this.tokenStats.set(vaultType, stats);
+      }
+      stats.totalFees += absAmount;
+      stats.feeCount++;
+      stats.lastFeeTimestamp = timestamp;
+    }
 
-    if (this.onFeeDetected) {
+    // Create Proof-of-History entry if enabled (for both FEE and CLAIM)
+    if (this.historyLog && this.historyFile) {
+      const prevHash = this.historyLog.latestHash;
+      const sequence = this.historyLog.entryCount + 1;
+
+      const entryData: Omit<HistoryEntry, 'hash'> = {
+        sequence,
+        prevHash,
+        eventType,
+        vaultType,
+        vault: vault.toBase58(),
+        amount: amount.toString(),
+        balanceBefore: balanceBefore.toString(),
+        balanceAfter: balanceAfter.toString(),
+        slot,
+        timestamp,
+        date: new Date(timestamp).toISOString(),
+      };
+
+      const hash = computeEntryHash(entryData);
+      const entry: HistoryEntry = { ...entryData, hash };
+
+      // Update history log
+      this.historyLog.entries.push(entry);
+      this.historyLog.entryCount = sequence;
+      this.historyLog.latestHash = hash;
+      this.historyLog.lastUpdated = new Date().toISOString();
+
+      // Only add to totalFees for FEE events
+      if (eventType === 'FEE') {
+        this.historyLog.totalFees = (BigInt(this.historyLog.totalFees) + absAmount).toString();
+      }
+
+      // Save to file
+      saveHistoryLog(this.historyFile, this.historyLog);
+
+      // Callback
+      if (this.onHistoryEntry) {
+        this.onHistoryEntry(entry);
+      }
+    }
+
+    // Log the event
+    if (eventType === 'FEE') {
+      this.log(`${vaultType}: +${Number(absAmount) / 1e9} SOL`);
+    } else {
+      this.log(`${vaultType}: CLAIM -${Number(absAmount) / 1e9} SOL`);
+    }
+
+    // Only call onFeeDetected for FEE events
+    if (eventType === 'FEE' && this.onFeeDetected) {
+      const record: FeeRecord = {
+        mint: 'unknown',
+        symbol: vaultType,
+        amount: absAmount,
+        timestamp,
+        slot,
+      };
       this.onFeeDetected(record);
     }
   }

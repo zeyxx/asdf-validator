@@ -582,7 +582,8 @@ async function main(): Promise<void> {
 
   // Handle shutdown
   let shuttingDown = false;
-  const shutdown = () => {
+  // Initialize shutdown handler (will be replaced in live mode)
+  let shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
 
@@ -634,12 +635,124 @@ async function main(): Promise<void> {
   }
   await daemon.start();
 
+  // Capture initial balances for live mode comparison
+  let initialBc = 0n;
+  let initialAmm = 0n;
+  if (args.liveMode) {
+    try {
+      const { bc, amm } = await daemon.fetchCurrentBalances();
+      initialBc = bc;
+      initialAmm = amm;
+    } catch (e) {
+      // Ignore initial fetch error
+    }
+  }
+
   // Start dashboard after daemon is running
   if (dashboard) {
     dashboard.start();
   } else {
     console.log('✅ Daemon running. Press Ctrl+C to stop.\n');
   }
+
+  // Update shutdown function to use initial balances
+  const oldShutdown = process.listeners('SIGINT')[0] as () => void;
+  if (oldShutdown) {
+      process.removeListener('SIGINT', oldShutdown);
+      process.removeListener('SIGTERM', oldShutdown);
+  }
+
+  // Redefine shutdown handler
+  shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    // Stop dashboard first
+    if (dashboard) {
+      dashboard.stop();
+    }
+
+    console.log('\n\n🛑 Shutting down...');
+    
+    // Fetch final balances BEFORE stopping daemon (while RPC is hot)
+    let finalBc = 0n;
+    let finalAmm = 0n;
+    if (args.liveMode) {
+      try {
+        const { bc, amm } = await daemon.fetchCurrentBalances();
+        finalBc = bc;
+        finalAmm = amm;
+      } catch (e) {
+        // Ignore final fetch error
+      }
+    }
+
+    daemon.stop();
+
+    const total = daemon.getTotalFees();
+    const stats = daemon.getStats();
+    const historyLog = daemon.getHistoryLog();
+    const orphanFees = daemon.getOrphanFees();
+
+    console.log('\n📊 FINAL STATS');
+    console.log('═'.repeat(40));
+    console.log(`Total fees tracked: ${(Number(total) / 1e9).toFixed(6)} SOL`);
+
+    for (const s of stats) {
+      if (s.totalFees > 0n) {
+        console.log(`  ${s.symbol}: ${(Number(s.totalFees) / 1e9).toFixed(6)} SOL`);
+      }
+    }
+    
+    if (orphanFees > 0n) {
+      console.log(`  [ORPHAN]: ${(Number(orphanFees) / 1e9).toFixed(6)} SOL`);
+    }
+
+    // Live Mode Comparison
+    if (args.liveMode && initialBc > 0n) {
+      const deltaBc = finalBc - initialBc;
+      const deltaAmm = finalAmm - initialAmm;
+      const totalDelta = deltaBc + deltaAmm;
+      const diff = totalDelta - total;
+
+      console.log('');
+      console.log('⚖️  SESSION COMPARISON');
+      console.log('─'.repeat(40));
+      console.log(`Initial State: ${Number(initialBc)/1e9} SOL (BC) | ${Number(initialAmm)/1e9} SOL (AMM)`);
+      console.log(`Final State:   ${Number(finalBc)/1e9} SOL (BC) | ${Number(finalAmm)/1e9} SOL (AMM)`);
+      console.log('─'.repeat(40));
+      console.log(`On-Chain Delta: ${(Number(totalDelta)/1e9).toFixed(6)} SOL`);
+      console.log(`Tracker Fees:   ${(Number(total)/1e9).toFixed(6)} SOL`);
+      console.log(`Difference:     ${(Number(diff)/1e9).toFixed(6)} SOL`);
+      
+      if (diff === 0n) {
+        console.log('✅ PERFECT MATCH');
+      } else if (diff < 0n) {
+        console.log('⚠️  Difference detected (Likely withdrawals)');
+      } else {
+        console.log('⚠️  Difference detected (Missed fees?)');
+      }
+    }
+
+    // Show PoH summary if enabled
+    if (historyLog && args.historyFile) {
+      console.log('');
+      console.log('🔗 PROOF-OF-HISTORY');
+      console.log('─'.repeat(40));
+      console.log(`Entries:     ${historyLog.entryCount}`);
+      console.log(`Latest hash: ${historyLog.latestHash.slice(0, 32)}...`);
+      console.log(`Saved to:    ${args.historyFile}`);
+      console.log('');
+      console.log('Verify with: npx asdf-validator --verify ' + args.historyFile);
+    }
+
+    console.log('═'.repeat(40));
+    console.log('\n✅ Goodbye!\n');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 main().catch((error) => {

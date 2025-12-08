@@ -121,6 +121,15 @@ header h1 {
   background: linear-gradient(135deg, var(--bg-card) 0%, rgba(0, 212, 170, 0.1) 100%);
 }
 
+.stat-card.orphan-fees {
+  border-color: var(--warning);
+  background: linear-gradient(135deg, var(--bg-card) 0%, rgba(210, 153, 34, 0.1) 100%);
+}
+
+.stat-card.orphan-fees .stat-value {
+  color: var(--warning);
+}
+
 .stat-card.flash {
   animation: flash 0.3s ease-out;
 }

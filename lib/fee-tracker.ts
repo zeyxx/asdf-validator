@@ -1,5 +1,6 @@
 import { PublicKey, VersionedTransactionResponse } from '@solana/web3.js';
 import * as fs from 'fs';
+import * as path from 'path';
 import { RpcManager } from './rpc-manager';
 import { TokenManager, deriveBondingCurve, deriveAMMPool } from './token-manager';
 import { HistoryManager } from './history-manager';
@@ -35,6 +36,86 @@ interface TrackerState {
   accumulatedAmmDelta: string; // BigInt as string
   totalOrphanFees: string; // BigInt as string
   trackedTokens: Record<string, any>; // Simplified serialization
+}
+
+export interface StateValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
+/**
+ * Validate TrackerState schema
+ */
+function validateTrackerState(data: unknown): StateValidationResult {
+  if (typeof data !== 'object' || data === null) {
+    return { valid: false, error: 'State must be an object' };
+  }
+
+  const state = data as Record<string, unknown>;
+
+  // Validate bigint string fields
+  const bigintFields = ['lastBcBalance', 'lastAmmBalance'];
+  for (const field of bigintFields) {
+    if (state[field] !== undefined) {
+      const val = state[field];
+      if (typeof val !== 'string') {
+        return { valid: false, error: `${field} must be a string` };
+      }
+      try {
+        BigInt(val);
+      } catch {
+        return { valid: false, error: `${field} must be a valid bigint string` };
+      }
+    }
+  }
+
+  // Optional bigint fields (added later, backwards compatible)
+  const optionalBigintFields = ['accumulatedBcDelta', 'accumulatedAmmDelta', 'totalOrphanFees'];
+  for (const field of optionalBigintFields) {
+    if (state[field] !== undefined) {
+      const val = state[field];
+      if (typeof val !== 'string') {
+        return { valid: false, error: `${field} must be a string` };
+      }
+      try {
+        BigInt(val);
+      } catch {
+        return { valid: false, error: `${field} must be a valid bigint string` };
+      }
+    }
+  }
+
+  // trackedTokens must be an object if present
+  if (state.trackedTokens !== undefined && typeof state.trackedTokens !== 'object') {
+    return { valid: false, error: 'trackedTokens must be an object' };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Create backup of state file with rotation
+ */
+function createStateBackup(stateFile: string, maxBackups: number = 3): void {
+  if (!fs.existsSync(stateFile)) return;
+
+  const dir = path.dirname(stateFile);
+  const base = path.basename(stateFile);
+  const backupPath = path.join(dir, `${base}.backup.${Date.now()}`);
+
+  // Create new backup
+  fs.copyFileSync(stateFile, backupPath);
+
+  // Rotate old backups
+  const backupFiles = fs.readdirSync(dir)
+    .filter(f => f.startsWith(`${base}.backup.`))
+    .sort()
+    .reverse();
+
+  // Remove excess backups
+  for (let i = maxBackups; i < backupFiles.length; i++) {
+    fs.unlinkSync(path.join(dir, backupFiles[i]));
+  }
 }
 
 export class FeeTracker {
@@ -119,16 +200,29 @@ export class FeeTracker {
     // Load state if exists
     if (this.config.stateFile && fs.existsSync(this.config.stateFile)) {
       try {
-        const data = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf-8')) as TrackerState;
-        this.lastBcSignature = data.lastBcSignature;
-        this.lastAmmSignature = data.lastAmmSignature;
-        this.lastBcBalance = BigInt(data.lastBcBalance);
-        this.lastAmmBalance = BigInt(data.lastAmmBalance);
-        // Restore accumulated deltas and orphan fees (new fields, backwards compatible)
-        this.accumulatedBcDelta = data.accumulatedBcDelta ? BigInt(data.accumulatedBcDelta) : 0n;
-        this.accumulatedAmmDelta = data.accumulatedAmmDelta ? BigInt(data.accumulatedAmmDelta) : 0n;
-        this.totalOrphanFees = data.totalOrphanFees ? BigInt(data.totalOrphanFees) : 0n;
-        this.log(`State restored: BC=${this.lastBcBalance}, AMM=${this.lastAmmBalance}, orphan=${this.totalOrphanFees}`);
+        // Create backup before loading (rotation: keep last 3)
+        createStateBackup(this.config.stateFile, 3);
+        this.log('State backup created');
+
+        const rawData = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf-8'));
+
+        // Validate state schema
+        const validation = validateTrackerState(rawData);
+        if (!validation.valid) {
+          console.warn(`State validation failed: ${validation.error}. Using default state.`);
+          // Don't restore invalid state - use defaults
+        } else {
+          const data = rawData as TrackerState;
+          this.lastBcSignature = data.lastBcSignature;
+          this.lastAmmSignature = data.lastAmmSignature;
+          this.lastBcBalance = BigInt(data.lastBcBalance);
+          this.lastAmmBalance = BigInt(data.lastAmmBalance);
+          // Restore accumulated deltas and orphan fees (new fields, backwards compatible)
+          this.accumulatedBcDelta = data.accumulatedBcDelta ? BigInt(data.accumulatedBcDelta) : 0n;
+          this.accumulatedAmmDelta = data.accumulatedAmmDelta ? BigInt(data.accumulatedAmmDelta) : 0n;
+          this.totalOrphanFees = data.totalOrphanFees ? BigInt(data.totalOrphanFees) : 0n;
+          this.log(`State restored: BC=${this.lastBcBalance}, AMM=${this.lastAmmBalance}, orphan=${this.totalOrphanFees}`);
+        }
       } catch (e) {
         console.warn('Failed to load state file:', e);
       }

@@ -48,6 +48,11 @@
         <div class="stat-value" id="fee-count">0</div>
         <div class="stat-unit">events</div>
       </div>
+      <div class="stat-card orphan-fees">
+        <div class="stat-label">Orphan Fees</div>
+        <div class="stat-value" id="orphan-fees">0.000000</div>
+        <div class="stat-unit">SOL (<span id="orphan-count">0</span> events)</div>
+      </div>
     </div>
 
     <!-- Tokens Table -->
@@ -78,6 +83,12 @@
     <div class="chart-container">
       <h2>Real-time Fees</h2>
       <canvas id="fees-chart"></canvas>
+    </div>
+
+    <!-- Hourly Chart -->
+    <div class="chart-container hourly-chart">
+      <h2>Fees per Hour (Last 24h)</h2>
+      <canvas id="hourly-chart"></canvas>
     </div>
 
     <!-- Recent Fees -->

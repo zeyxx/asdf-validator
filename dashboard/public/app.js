@@ -5,6 +5,8 @@
 // State
 let totalFees = 0;
 let feeCount = 0;
+let orphanFees = 0;
+let orphanFeeCount = 0;
 let chartData = [];
 const MAX_CHART_POINTS = 60;
 
@@ -16,6 +18,8 @@ const totalFeesEl = document.getElementById('total-fees');
 const bcBalanceEl = document.getElementById('bc-balance');
 const ammBalanceEl = document.getElementById('amm-balance');
 const feeCountEl = document.getElementById('fee-count');
+const orphanFeesEl = document.getElementById('orphan-fees');
+const orphanCountEl = document.getElementById('orphan-count');
 const feesTbody = document.getElementById('fees-tbody');
 const tokensTbody = document.getElementById('tokens-tbody');
 const lastUpdateEl = document.getElementById('last-update');
@@ -70,6 +74,66 @@ const chart = new Chart(ctx, {
     }
   }
 });
+
+// Hourly chart setup
+const hourlyCtx = document.getElementById('hourly-chart').getContext('2d');
+const hourlyChart = new Chart(hourlyCtx, {
+  type: 'bar',
+  data: {
+    labels: [],
+    datasets: [{
+      label: 'Fees per Hour (SOL)',
+      data: [],
+      backgroundColor: 'rgba(147, 112, 219, 0.6)',
+      borderColor: 'rgba(147, 112, 219, 1)',
+      borderWidth: 1,
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: {
+        display: true,
+        grid: {
+          color: 'rgba(255, 255, 255, 0.1)'
+        },
+        ticks: {
+          color: '#888',
+          maxRotation: 45,
+          minRotation: 45
+        }
+      },
+      y: {
+        display: true,
+        beginAtZero: true,
+        grid: {
+          color: 'rgba(255, 255, 255, 0.1)'
+        },
+        ticks: {
+          color: '#888'
+        }
+      }
+    },
+    plugins: {
+      legend: {
+        display: false
+      }
+    },
+    animation: {
+      duration: 0
+    }
+  }
+});
+
+// Update hourly chart
+function updateHourlyChart(feesPerHour) {
+  if (!feesPerHour || feesPerHour.length === 0) return;
+
+  hourlyChart.data.labels = feesPerHour.map(b => b.hour);
+  hourlyChart.data.datasets[0].data = feesPerHour.map(b => b.amount);
+  hourlyChart.update('none');
+}
 
 // Format time
 function formatTime(timestamp) {
@@ -183,6 +247,14 @@ function handleMessage(event) {
       feeCount = state.feeCount;
       setConnected(state.connected);
 
+      // Update orphan fees
+      if (state.orphanFees !== undefined) {
+        orphanFeesEl.textContent = state.orphanFees;
+        orphanCountEl.textContent = state.orphanFeeCount;
+        orphanFees = parseFloat(state.orphanFees);
+        orphanFeeCount = state.orphanFeeCount;
+      }
+
       // Add recent fees to table
       if (state.recentFees && state.recentFees.length > 0) {
         feesTbody.innerHTML = '';
@@ -196,6 +268,11 @@ function handleMessage(event) {
 
       // Initialize chart
       updateChart(state.totalFees);
+
+      // Initialize hourly chart
+      if (state.feesPerHour) {
+        updateHourlyChart(state.feesPerHour);
+      }
       break;
 
     case 'fee':
@@ -206,6 +283,14 @@ function handleMessage(event) {
       totalFees = parseFloat(fee.totalFees);
       feeCount = fee.feeCount;
 
+      // Update orphan fees
+      if (fee.orphanFees !== undefined) {
+        orphanFeesEl.textContent = fee.orphanFees;
+        orphanCountEl.textContent = fee.orphanFeeCount;
+        orphanFees = parseFloat(fee.orphanFees);
+        orphanFeeCount = fee.orphanFeeCount;
+      }
+
       addFeeToTable(fee);
       updateChart(fee.totalFees);
       updateLastUpdate();
@@ -215,10 +300,22 @@ function handleMessage(event) {
         updateTokensTable(fee.tokens);
       }
 
-      // Flash the total fees card
+      // Update hourly chart
+      if (fee.feesPerHour) {
+        updateHourlyChart(fee.feesPerHour);
+      }
+
+      // Flash the appropriate card
       const totalCard = document.querySelector('.stat-card.total-fees');
       totalCard.classList.add('flash');
       setTimeout(() => totalCard.classList.remove('flash'), 300);
+
+      // Flash orphan card if it's an orphan fee
+      if (fee.isOrphan) {
+        const orphanCard = document.querySelector('.stat-card.orphan-fees');
+        orphanCard.classList.add('flash');
+        setTimeout(() => orphanCard.classList.remove('flash'), 300);
+      }
       break;
 
     case 'balance':

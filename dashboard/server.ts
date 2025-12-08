@@ -34,6 +34,12 @@ interface TokenStatsDisplay {
   migrated: boolean;
 }
 
+interface HourlyFee {
+  hour: string; // Format: "HH:00"
+  timestamp: number; // Hour start timestamp
+  amount: number; // SOL
+}
+
 interface DashboardState {
   creator: string;
   bcVault: string;
@@ -42,6 +48,8 @@ interface DashboardState {
   ammBalance: string;
   totalFees: string;
   feeCount: number;
+  orphanFees: string;
+  orphanFeeCount: number;
   lastUpdate: number;
   recentFees: Array<{
     amount: string;
@@ -52,6 +60,7 @@ interface DashboardState {
     symbol?: string;
   }>;
   tokens: TokenStatsDisplay[];
+  feesPerHour: HourlyFee[];
   connected: boolean;
 }
 
@@ -90,11 +99,77 @@ const state: DashboardState = {
   ammBalance: '0',
   totalFees: '0',
   feeCount: 0,
+  orphanFees: '0',
+  orphanFeeCount: 0,
   lastUpdate: Date.now(),
   recentFees: [],
   tokens: [],
+  feesPerHour: initializeHourlyBuckets(),
   connected: false,
 };
+
+// Initialize 24 hourly buckets
+function initializeHourlyBuckets(): HourlyFee[] {
+  const buckets: HourlyFee[] = [];
+  const now = Date.now();
+  for (let i = 23; i >= 0; i--) {
+    const hourStart = new Date(now - i * 60 * 60 * 1000);
+    hourStart.setMinutes(0, 0, 0);
+    buckets.push({
+      hour: hourStart.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+      timestamp: hourStart.getTime(),
+      amount: 0,
+    });
+  }
+  return buckets;
+}
+
+// Get hour key for bucketing
+function getHourKey(timestamp: number): string {
+  const date = new Date(timestamp);
+  date.setMinutes(0, 0, 0);
+  return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+// Update hourly buckets with new fee
+function updateHourlyBuckets(feeTimestamp: number, amount: number): void {
+  const now = Date.now();
+  const hourKey = getHourKey(feeTimestamp);
+  const hourStart = new Date(feeTimestamp);
+  hourStart.setMinutes(0, 0, 0);
+
+  // Find or create bucket
+  let bucket = state.feesPerHour.find(b => b.hour === hourKey);
+  if (bucket) {
+    bucket.amount += amount;
+  } else {
+    // Add new bucket
+    state.feesPerHour.push({
+      hour: hourKey,
+      timestamp: hourStart.getTime(),
+      amount,
+    });
+  }
+
+  // Prune old buckets (keep last 24 hours)
+  const cutoff = now - 24 * 60 * 60 * 1000;
+  state.feesPerHour = state.feesPerHour
+    .filter(b => b.timestamp >= cutoff)
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  // Ensure we always have 24 buckets (fill gaps)
+  const newBuckets = initializeHourlyBuckets();
+  for (const existingBucket of state.feesPerHour) {
+    const match = newBuckets.find(b => b.hour === existingBucket.hour);
+    if (match) {
+      match.amount = existingBucket.amount;
+    }
+  }
+  state.feesPerHour = newBuckets;
+}
+
+// RPC Manager (initialized in start())
+let rpcManager: RpcManager | null = null;
 
 // Helper to update token stats
 function updateTokenStats() {
@@ -107,6 +182,19 @@ function updateTokenStats() {
     lastFeeTimestamp: s.lastFeeTimestamp,
     migrated: s.migrated || false,
   })).sort((a, b) => parseFloat(b.totalFees) - parseFloat(a.totalFees));
+}
+
+// Helper to calculate orphan fees from recent fees
+function calculateOrphanStats(): { total: number; count: number } {
+  let total = 0;
+  let count = 0;
+  for (const fee of state.recentFees) {
+    if (fee.symbol === 'ORPHAN' || fee.mint === 'orphan') {
+      total += parseFloat(fee.amount);
+      count++;
+    }
+  }
+  return { total, count };
 }
 
 // Create Express app
@@ -136,9 +224,24 @@ app.get('/api/config', (req, res) => {
 
 // Health check endpoint
 const startTime = Date.now();
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const uptimeMs = Date.now() - startTime;
   const memUsage = process.memoryUsage();
+
+  // Get circuit breaker state
+  const circuitBreakerState = rpcManager
+    ? rpcManager.getCircuitBreakerState()
+    : { state: 'UNKNOWN', canExecute: false };
+
+  // Get RPC health (async)
+  let rpcHealth = { healthy: false, latencyMs: 0, error: 'Not initialized' };
+  if (rpcManager) {
+    try {
+      rpcHealth = await rpcManager.checkHealth(5000);
+    } catch (e) {
+      rpcHealth = { healthy: false, latencyMs: 0, error: String(e) };
+    }
+  }
 
   const healthData = {
     status: state.connected ? 'healthy' : 'degraded',
@@ -155,6 +258,16 @@ app.get('/health', (req, res) => {
       updateCount: tracker.getUpdateCount(),
       feeCount: state.feeCount,
     },
+    circuitBreaker: {
+      state: circuitBreakerState.state,
+      canExecute: circuitBreakerState.canExecute,
+      description: getCircuitBreakerDescription(circuitBreakerState.state),
+    },
+    rpc: {
+      healthy: rpcHealth.healthy,
+      latencyMs: rpcHealth.latencyMs,
+      error: rpcHealth.error,
+    },
     memory: {
       heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
       heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
@@ -167,6 +280,87 @@ app.get('/health', (req, res) => {
   // Return 200 for healthy/degraded, 503 for down
   const statusCode = state.connected ? 200 : 503;
   res.status(statusCode).json(healthData);
+});
+
+function getCircuitBreakerDescription(state: string): string {
+  switch (state) {
+    case 'CLOSED':
+      return 'RPC connection healthy';
+    case 'OPEN':
+      return 'RPC failures detected, blocking requests';
+    case 'HALF_OPEN':
+      return 'Testing RPC recovery';
+    default:
+      return 'Unknown state';
+  }
+}
+
+// Export endpoints
+app.get('/api/export/fees', (req, res) => {
+  const format = (req.query.format as string) || 'json';
+  const fees = state.recentFees;
+
+  if (format === 'csv') {
+    const headers = ['timestamp', 'date', 'amount', 'vault', 'slot', 'mint', 'symbol'];
+    const csvRows = [headers.join(',')];
+    for (const fee of fees) {
+      csvRows.push([
+        fee.timestamp,
+        new Date(fee.timestamp).toISOString(),
+        fee.amount,
+        fee.vault,
+        fee.slot,
+        fee.mint || '',
+        fee.symbol || '',
+      ].join(','));
+    }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="fees-${Date.now()}.csv"`);
+    res.send(csvRows.join('\n'));
+  } else {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="fees-${Date.now()}.json"`);
+    res.json({
+      exported: new Date().toISOString(),
+      creator: state.creator,
+      totalFees: state.totalFees,
+      feeCount: state.feeCount,
+      fees,
+    });
+  }
+});
+
+app.get('/api/export/tokens', (req, res) => {
+  const format = (req.query.format as string) || 'json';
+  const tokens = state.tokens;
+
+  if (format === 'csv') {
+    const headers = ['mint', 'symbol', 'name', 'totalFees', 'feeCount', 'lastFeeTimestamp', 'migrated'];
+    const csvRows = [headers.join(',')];
+    for (const token of tokens) {
+      csvRows.push([
+        token.mint,
+        token.symbol,
+        token.name || '',
+        token.totalFees,
+        token.feeCount,
+        token.lastFeeTimestamp,
+        token.migrated,
+      ].join(','));
+    }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="tokens-${Date.now()}.csv"`);
+    res.send(csvRows.join('\n'));
+  } else {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="tokens-${Date.now()}.json"`);
+    res.json({
+      exported: new Date().toISOString(),
+      creator: state.creator,
+      tokenCount: tokens.length,
+      tokens,
+    });
+  }
 });
 
 function formatUptime(ms: number): string {
@@ -221,6 +415,17 @@ const tracker = new RealtimeTracker({
     state.totalFees = formatSol(tracker.getTotalFees());
     state.lastUpdate = Date.now();
 
+    // Track orphan fees
+    const isOrphan = record.symbol === 'ORPHAN' || record.mint === 'orphan';
+    if (isOrphan) {
+      state.orphanFeeCount++;
+      state.orphanFees = (parseFloat(state.orphanFees) + Number(record.amount) / LAMPORTS_PER_SOL).toFixed(6);
+    }
+
+    // Update hourly buckets
+    const feeAmountSol = Number(record.amount) / LAMPORTS_PER_SOL;
+    updateHourlyBuckets(record.timestamp, feeAmountSol);
+
     // Update token stats
     updateTokenStats();
 
@@ -248,7 +453,11 @@ const tracker = new RealtimeTracker({
         symbol: record.symbol,
         totalFees: state.totalFees,
         feeCount: state.feeCount,
+        orphanFees: state.orphanFees,
+        orphanFeeCount: state.orphanFeeCount,
+        isOrphan,
         tokens: state.tokens,
+        feesPerHour: state.feesPerHour,
       },
     });
   },
@@ -303,7 +512,7 @@ async function start() {
 
   // Discover tokens created by this creator
   console.log('Discovering tokens...');
-  const rpcManager = new RpcManager(rpcUrl);
+  rpcManager = new RpcManager(rpcUrl);
   const tokenManager = new TokenManager(rpcManager);
 
   try {

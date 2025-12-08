@@ -1,0 +1,332 @@
+/**
+ * ASDF Validator Dashboard - Styles
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-card: #21262d;
+  --text-primary: #f0f6fc;
+  --text-secondary: #8b949e;
+  --accent: #00d4aa;
+  --accent-hover: #00e5bb;
+  --border: #30363d;
+  --success: #3fb950;
+  --warning: #d29922;
+  --error: #f85149;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* Header */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+
+header h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: var(--error);
+}
+
+.status-indicator.connected {
+  background-color: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+
+.status-indicator.disconnected {
+  background-color: var(--error);
+}
+
+/* Creator Info */
+.creator-info {
+  background-color: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 15px 20px;
+  margin-bottom: 20px;
+}
+
+.info-item label {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin-right: 10px;
+}
+
+.info-item .address {
+  font-family: 'Monaco', 'Consolas', monospace;
+  font-size: 0.9rem;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+/* Stats Grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 15px;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background-color: var(--bg-card);
+  border-radius: 12px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.stat-card.total-fees {
+  border-color: var(--accent);
+  background: linear-gradient(135deg, var(--bg-card) 0%, rgba(0, 212, 170, 0.1) 100%);
+}
+
+.stat-card.flash {
+  animation: flash 0.3s ease-out;
+}
+
+@keyframes flash {
+  0% { background-color: rgba(0, 212, 170, 0.3); }
+  100% { background-color: var(--bg-card); }
+}
+
+.stat-label {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin-bottom: 8px;
+}
+
+.stat-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  font-family: 'Monaco', 'Consolas', monospace;
+  color: var(--text-primary);
+}
+
+.stat-card.total-fees .stat-value {
+  color: var(--accent);
+}
+
+.stat-unit {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-top: 4px;
+}
+
+/* Chart Container */
+.chart-container {
+  background-color: var(--bg-card);
+  border-radius: 12px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  margin-bottom: 20px;
+  height: 300px;
+}
+
+.chart-container h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 15px;
+  color: var(--text-secondary);
+}
+
+.chart-container canvas {
+  max-height: 240px;
+}
+
+/* Recent Fees */
+.recent-fees {
+  background-color: var(--bg-card);
+  border-radius: 12px;
+  padding: 20px;
+  border: 1px solid var(--border);
+}
+
+.recent-fees h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 15px;
+  color: var(--text-secondary);
+}
+
+.fees-table-container {
+  overflow-x: auto;
+}
+
+#fees-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+#fees-table th,
+#fees-table td {
+  padding: 12px 15px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+#fees-table th {
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+#fees-table td {
+  font-family: 'Monaco', 'Consolas', monospace;
+  font-size: 0.9rem;
+}
+
+#fees-table .empty-row td {
+  text-align: center;
+  color: var(--text-secondary);
+  font-style: italic;
+  font-family: inherit;
+}
+
+.fee-row {
+  transition: background-color 0.3s;
+}
+
+.fee-row.new {
+  animation: highlight 0.5s ease-out;
+}
+
+@keyframes highlight {
+  0% { background-color: rgba(0, 212, 170, 0.2); }
+  100% { background-color: transparent; }
+}
+
+.fee-row:hover {
+  background-color: var(--bg-secondary);
+}
+
+.fee-row .amount {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.fee-row .vault {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.fee-row .vault.bc {
+  background-color: rgba(59, 185, 80, 0.2);
+  color: var(--success);
+}
+
+.fee-row .vault.amm {
+  background-color: rgba(210, 153, 34, 0.2);
+  color: var(--warning);
+}
+
+.fee-row .slot {
+  color: var(--text-secondary);
+}
+
+/* Footer */
+footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 0;
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.last-update span {
+  font-family: 'Monaco', 'Consolas', monospace;
+}
+
+.powered-by {
+  color: var(--text-secondary);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .container {
+    padding: 15px;
+  }
+
+  header {
+    flex-direction: column;
+    gap: 15px;
+    text-align: center;
+  }
+
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .stat-value {
+    font-size: 1.4rem;
+  }
+
+  .chart-container {
+    height: 250px;
+  }
+
+  #fees-table th,
+  #fees-table td {
+    padding: 10px;
+    font-size: 0.85rem;
+  }
+
+  footer {
+    flex-direction: column;
+    gap: 10px;
+    text-align: center;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+}

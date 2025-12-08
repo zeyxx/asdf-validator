@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASDF Validator Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <h1>ASDF Validator</h1>
+      <div class="status">
+        <span id="ws-status" class="status-indicator disconnected"></span>
+        <span id="ws-text">Connecting...</span>
+      </div>
+    </header>
+
+    <!-- Creator Info -->
+    <div class="creator-info">
+      <div class="info-item">
+        <label>Creator</label>
+        <span id="creator-address" class="address">Loading...</span>
+      </div>
+    </div>
+
+    <!-- Stats Cards -->
+    <div class="stats-grid">
+      <div class="stat-card total-fees">
+        <div class="stat-label">Total Fees</div>
+        <div class="stat-value" id="total-fees">0.000000</div>
+        <div class="stat-unit">SOL</div>
+      </div>
+      <div class="stat-card bc-balance">
+        <div class="stat-label">BC Vault</div>
+        <div class="stat-value" id="bc-balance">0.000000</div>
+        <div class="stat-unit">SOL</div>
+      </div>
+      <div class="stat-card amm-balance">
+        <div class="stat-label">AMM Vault</div>
+        <div class="stat-value" id="amm-balance">0.000000</div>
+        <div class="stat-unit">SOL</div>
+      </div>
+      <div class="stat-card fee-count">
+        <div class="stat-label">Fee Events</div>
+        <div class="stat-value" id="fee-count">0</div>
+        <div class="stat-unit">events</div>
+      </div>
+    </div>
+
+    <!-- Chart -->
+    <div class="chart-container">
+      <h2>Real-time Fees</h2>
+      <canvas id="fees-chart"></canvas>
+    </div>
+
+    <!-- Recent Fees -->
+    <div class="recent-fees">
+      <h2>Recent Fee Events</h2>
+      <div class="fees-table-container">
+        <table id="fees-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Amount</th>
+              <th>Vault</th>
+              <th>Slot</th>
+            </tr>
+          </thead>
+          <tbody id="fees-tbody">
+            <tr class="empty-row">
+              <td colspan="4">Waiting for fees...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+      <div class="last-update">
+        Last update: <span id="last-update">-</span>
+      </div>
+      <div class="powered-by">
+        Powered by WebSocket (~400ms latency)
+      </div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

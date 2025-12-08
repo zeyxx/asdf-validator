@@ -1,3 +1,17 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.env
+
+# Test & Coverage
+coverage/
+history*.json
+*.log
+
+# Secrets & Keys
+5zwN9NQei4fctQ8AfEk67PVoH1jSCSYCpfYkeamkpznj.json
+*.key
+id.json
+
+# System
+.DS_Store

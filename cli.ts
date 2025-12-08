@@ -12,6 +12,8 @@
 import {
   ValidatorDaemon,
   TokenConfig,
+  TokenStats,
+  FeeRecord,
   deriveBondingCurveVault,
   derivePumpSwapVault,
   HistoryEntry,
@@ -24,6 +26,22 @@ import {
 import { PublicKey, Connection } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
+
+// Load .env file if it exists
+const envPath = path.resolve(process.cwd(), '.env');
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, 'utf-8');
+  for (const line of envContent.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith('#')) {
+      const [key, ...valueParts] = trimmed.split('=');
+      const value = valueParts.join('=');
+      if (key && value && !process.env[key]) {
+        process.env[key] = value;
+      }
+    }
+  }
+}
 
 // ============================================================================
 // Argument Parsing
@@ -38,6 +56,7 @@ interface CLIArgs {
   pollInterval: number;
   historyFile: string | null;
   verifyFile: string | null;
+  liveMode: boolean;
 }
 
 function parseArgs(args: string[]): CLIArgs {
@@ -50,6 +69,7 @@ function parseArgs(args: string[]): CLIArgs {
     pollInterval: 5000,
     historyFile: null,
     verifyFile: null,
+    liveMode: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -59,6 +79,8 @@ function parseArgs(args: string[]): CLIArgs {
       result.showHelp = true;
     } else if (arg === '--verbose' || arg === '-v') {
       result.verbose = true;
+    } else if (arg === '--live' || arg === '-l') {
+      result.liveMode = true;
     } else if (arg === '--creator' || arg === '-c') {
       result.creatorAddress = args[++i];
     } else if (arg === '--rpc' || arg === '-r') {
@@ -104,6 +126,7 @@ OPTIONS:
   --interval, -i <SECONDS>  Poll interval (default: 5)
   --history, -H <FILE>      Enable Proof-of-History, save to FILE
   --verify, -V <FILE>       Verify a Proof-of-History file (standalone)
+  --live, -l                Enable live dashboard mode (in-line updates)
   --verbose, -v             Enable verbose logging
   --help, -h                Show this help
 
@@ -171,6 +194,193 @@ function loadTokens(filePath: string): TokenConfig[] {
   } catch (error) {
     console.error(`Error loading tokens from ${filePath}:`, error);
     return [];
+  }
+}
+
+// ============================================================================
+// Live Dashboard
+// ============================================================================
+
+interface LastFeeInfo {
+  symbol: string;
+  amount: bigint;
+  vaultType: string;
+  timestamp: number;
+}
+
+interface TokenFeeData {
+  symbol: string;
+  totalFees: bigint;
+  feeCount: number;
+  lastFeeTime: number;
+}
+
+class LiveDashboard {
+  private startTime: number = Date.now();
+  private feeCount: number = 0;
+  private lastFee: LastFeeInfo | null = null;
+  private bcBalance: bigint = 0n;
+  private pohEntries: number = 0;
+  private updateInterval: NodeJS.Timeout | null = null;
+  private tokenFees: Map<string, TokenFeeData> = new Map();
+
+  constructor(
+    private creator: string,
+    private bcVault: string,
+    private ammVault: string,
+    private historyEnabled: boolean
+  ) {}
+
+  start(): void {
+    // Hide cursor and clear screen
+    process.stdout.write('\x1b[?25l\x1b[2J\x1b[H');
+    this.render();
+    // Update every second
+    this.updateInterval = setInterval(() => this.render(), 1000);
+  }
+
+  stop(): void {
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
+    // Show cursor
+    process.stdout.write('\x1b[?25h');
+  }
+
+  setPohEntries(count: number): void {
+    this.pohEntries = count;
+  }
+
+  logFee(record: FeeRecord): void {
+    this.feeCount++;
+    this.lastFee = {
+      symbol: record.symbol,
+      amount: record.amount,
+      vaultType: 'BC', // Default, could be enhanced
+      timestamp: Date.now(),
+    };
+
+    // Accumulate per-token fees
+    const key = record.symbol;
+    const existing = this.tokenFees.get(key);
+    if (existing) {
+      existing.totalFees += record.amount;
+      existing.feeCount++;
+      existing.lastFeeTime = Date.now();
+    } else {
+      this.tokenFees.set(key, {
+        symbol: record.symbol,
+        totalFees: record.amount,
+        feeCount: 1,
+        lastFeeTime: Date.now(),
+      });
+    }
+
+    // Update BC balance (accumulated fees)
+    this.bcBalance += record.amount;
+  }
+
+  private formatUptime(): string {
+    const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    return `${mins}m ${secs.toString().padStart(2, '0')}s`;
+  }
+
+  private formatSOL(lamports: bigint): string {
+    return (Number(lamports) / 1e9).toFixed(6);
+  }
+
+  private formatTimeAgo(timestamp: number): string {
+    const secs = Math.floor((Date.now() - timestamp) / 1000);
+    if (secs < 60) return `${secs}s ago`;
+    const mins = Math.floor(secs / 60);
+    return `${mins}m ago`;
+  }
+
+  private render(): void {
+    const W = 64; // Width
+    const lines: string[] = [];
+
+    // Move cursor to top-left
+    process.stdout.write('\x1b[H');
+
+    // Header
+    lines.push('┌' + '─'.repeat(W - 2) + '┐');
+    const title = `🔥 ASDF VALIDATOR - LIVE`;
+    const uptime = `⏱ ${this.formatUptime()}`;
+    const headerContent = `  ${title}${' '.repeat(W - 6 - title.length - uptime.length)}${uptime}  `;
+    lines.push('│' + headerContent.slice(0, W - 2) + '│');
+    lines.push('├' + '─'.repeat(W - 2) + '┤');
+
+    // Fees accumulated section
+    const bcStr = `Total Fees: ${this.formatSOL(this.bcBalance)} SOL`;
+    const countStr = `${this.feeCount} transactions`;
+    const vaultLine = `  ${bcStr}${' '.repeat(Math.max(1, 32 - bcStr.length))}${countStr}`;
+    lines.push('│' + vaultLine.padEnd(W - 2) + '│');
+    lines.push('├' + '─'.repeat(W - 2) + '┤');
+
+    // Tokens header
+    lines.push('│' + '  TOKEN              │  TOTAL FEES   │ COUNT │  LAST     '.padEnd(W - 2) + '│');
+    lines.push('│' + '  ───────────────────┼───────────────┼───────┼───────────'.padEnd(W - 2) + '│');
+
+    // Token rows (up to 8) - use accumulated tokenFees
+    const tokenList = Array.from(this.tokenFees.values())
+      .sort((a, b) => Number(b.totalFees - a.totalFees))
+      .slice(0, 8);
+
+    if (tokenList.length === 0) {
+      lines.push('│' + '  (waiting for fees...)'.padEnd(W - 2) + '│');
+    } else {
+      for (const t of tokenList) {
+        const symbol = t.symbol.slice(0, 18).padEnd(18);
+        const fees = this.formatSOL(t.totalFees).padStart(12);
+        const count = t.feeCount.toString().padStart(5);
+        const lastTime = t.lastFeeTime > 0
+          ? this.formatTimeAgo(t.lastFeeTime).padEnd(9)
+          : '-'.padEnd(9);
+        const row = `  ${symbol} │ ${fees} SOL │ ${count} │ ${lastTime}`;
+        lines.push('│' + row.slice(0, W - 2).padEnd(W - 2) + '│');
+      }
+    }
+
+    // Fill empty rows if less than 3 tokens
+    const minRows = 3;
+    for (let i = tokenList.length; i < minRows && tokenList.length > 0; i++) {
+      lines.push('│' + ' '.repeat(W - 2) + '│');
+    }
+
+    lines.push('├' + '─'.repeat(W - 2) + '┤');
+
+    // Summary line - use bcBalance (accumulated fees)
+    const totalStr = `TOTAL: ${this.formatSOL(this.bcBalance)} SOL`;
+    const feesStr = `FEES: ${this.feeCount}`;
+    const pohStr = this.historyEnabled ? `PoH: ✓ ${this.pohEntries}` : 'PoH: -';
+    const summaryLine = `  ${totalStr} │ ${feesStr} │ ${pohStr}`;
+    lines.push('│' + summaryLine.padEnd(W - 2) + '│');
+
+    lines.push('├' + '─'.repeat(W - 2) + '┤');
+
+    // Last fee line
+    let lastLine = '  (waiting for fees...)';
+    if (this.lastFee) {
+      const sign = '+';
+      const amt = this.formatSOL(this.lastFee.amount);
+      const time = new Date().toISOString().slice(11, 19);
+      lastLine = `  LAST: ${sign}${amt} SOL → ${this.lastFee.symbol} @ ${time}`;
+    }
+    lines.push('│' + lastLine.padEnd(W - 2) + '│');
+
+    lines.push('└' + '─'.repeat(W - 2) + '┘');
+
+    // Footer
+    lines.push('\n  Press Ctrl+C to stop');
+
+    // Clear each line and print
+    for (const line of lines) {
+      process.stdout.write(line + '\x1b[K\n');
+    }
   }
 }
 
@@ -285,26 +495,42 @@ async function main(): Promise<void> {
   const bcVault = deriveBondingCurveVault(creator);
   const ammVault = derivePumpSwapVault(creator);
 
-  console.log('\n🔥 ASDF VALIDATOR DAEMON');
-  console.log('═'.repeat(55));
-  console.log(`Creator:    ${creator.toBase58()}`);
-  console.log(`BC Vault:   ${bcVault.toBase58()}`);
-  console.log(`AMM Vault:  ${ammVault.toBase58()}`);
-  console.log(`RPC:        ${args.rpcUrl.slice(0, 50)}...`);
-  console.log(`Poll:       ${args.pollInterval / 1000}s`);
-  if (args.historyFile) {
-    console.log(`PoH:        ${args.historyFile} ✓`);
+  // Show header only in non-live mode
+  if (!args.liveMode) {
+    console.log('\n🔥 ASDF VALIDATOR DAEMON');
+    console.log('═'.repeat(55));
+    console.log(`Creator:    ${creator.toBase58()}`);
+    console.log(`BC Vault:   ${bcVault.toBase58()}`);
+    console.log(`AMM Vault:  ${ammVault.toBase58()}`);
+    console.log(`RPC:        ${args.rpcUrl.slice(0, 50)}...`);
+    console.log(`Poll:       ${args.pollInterval / 1000}s`);
+    if (args.historyFile) {
+      console.log(`PoH:        ${args.historyFile} ✓`);
+    }
+    console.log('═'.repeat(55));
   }
-  console.log('═'.repeat(55));
 
   // Load tokens if file provided
   let tokens: TokenConfig[] = [];
   if (args.tokensFile) {
     tokens = loadTokens(args.tokensFile);
-    console.log(`\n📦 Loaded ${tokens.length} token(s):`);
-    for (const t of tokens) {
-      console.log(`   • ${t.symbol} (${t.poolType})`);
+    if (!args.liveMode) {
+      console.log(`\n📦 Loaded ${tokens.length} token(s):`);
+      for (const t of tokens) {
+        console.log(`   • ${t.symbol} (${t.poolType})`);
+      }
     }
+  }
+
+  // Create live dashboard if enabled
+  let dashboard: LiveDashboard | null = null;
+  if (args.liveMode) {
+    dashboard = new LiveDashboard(
+      creator.toBase58(),
+      bcVault.toBase58(),
+      ammVault.toBase58(),
+      !!args.historyFile
+    );
   }
 
   // Create daemon
@@ -313,32 +539,44 @@ async function main(): Promise<void> {
     creatorAddress: args.creatorAddress,
     tokens: tokens.length > 0 ? tokens : undefined,
     pollInterval: args.pollInterval,
-    verbose: args.verbose,
+    verbose: args.verbose && !args.liveMode, // Disable verbose in live mode
     historyFile: args.historyFile || undefined,
 
     onFeeDetected: (record) => {
-      const sol = Number(record.amount) / 1e9;
-      const time = new Date().toISOString().slice(11, 19);
-      console.log(`[${time}] 💰 ${record.symbol}: +${sol.toFixed(6)} SOL`);
+      if (dashboard) {
+        dashboard.logFee(record);
+      } else {
+        const sol = Number(record.amount) / 1e9;
+        const time = new Date().toISOString().slice(11, 19);
+        console.log(`[${time}] 💰 ${record.symbol}: +${sol.toFixed(6)} SOL`);
+      }
     },
 
     onHistoryEntry: args.historyFile ? (entry) => {
-      const icon = entry.eventType === 'CLAIM' ? '📤' : '🔗';
-      console.log(`         ${icon} Hash: ${entry.hash.slice(0, 16)}... (${entry.eventType} #${entry.sequence})`);
+      if (dashboard) {
+        dashboard.setPohEntries(entry.sequence);
+      } else {
+        const icon = entry.eventType === 'CLAIM' ? '📤' : '🔗';
+        console.log(`         ${icon} Hash: ${entry.hash.slice(0, 16)}... (${entry.eventType} #${entry.sequence})`);
+      }
     } : undefined,
 
     onStats: (stats) => {
-      const total = stats.reduce((sum, s) => sum + Number(s.totalFees), 0);
-      console.log('\n📊 STATS');
-      console.log('─'.repeat(40));
-      console.log(`Total: ${(total / 1e9).toFixed(6)} SOL`);
-      for (const s of stats) {
-        if (s.totalFees > 0n) {
-          const pct = total > 0 ? (Number(s.totalFees) / total * 100).toFixed(1) : '0';
-          console.log(`  ${s.symbol}: ${(Number(s.totalFees) / 1e9).toFixed(6)} SOL (${pct}%)`);
+      // In live mode, dashboard keeps its own state via logFee
+      // Only show stats in non-live mode
+      if (!dashboard) {
+        const total = stats.reduce((sum, s) => sum + Number(s.totalFees), 0);
+        console.log('\n📊 STATS');
+        console.log('─'.repeat(40));
+        console.log(`Total: ${(total / 1e9).toFixed(6)} SOL`);
+        for (const s of stats) {
+          if (s.totalFees > 0n) {
+            const pct = total > 0 ? (Number(s.totalFees) / total * 100).toFixed(1) : '0';
+            console.log(`  ${s.symbol}: ${(Number(s.totalFees) / 1e9).toFixed(6)} SOL (${pct}%)`);
+          }
         }
+        console.log('─'.repeat(40) + '\n');
       }
-      console.log('─'.repeat(40) + '\n');
     },
   });
 
@@ -347,6 +585,11 @@ async function main(): Promise<void> {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+
+    // Stop dashboard first
+    if (dashboard) {
+      dashboard.stop();
+    }
 
     console.log('\n\n🛑 Shutting down...');
     daemon.stop();
@@ -386,9 +629,17 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
 
   // Start daemon
-  console.log('\n▶ Starting daemon...\n');
+  if (!args.liveMode) {
+    console.log('\n▶ Starting daemon...\n');
+  }
   await daemon.start();
-  console.log('✅ Daemon running. Press Ctrl+C to stop.\n');
+
+  // Start dashboard after daemon is running
+  if (dashboard) {
+    dashboard.start();
+  } else {
+    console.log('✅ Daemon running. Press Ctrl+C to stop.\n');
+  }
 }
 
 main().catch((error) => {

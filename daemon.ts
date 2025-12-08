@@ -5,6 +5,8 @@ import { RpcManager } from './lib/rpc-manager';
 import { TokenManager, deriveBondingCurveVault, derivePumpSwapVault, deriveAMMPool, deriveBondingCurve, DiscoveredToken } from './lib/token-manager';
 import { FeeTracker, FeeTrackerConfig } from './lib/fee-tracker';
 import { HistoryManager, HistoryEntry, HistoryLog, GENESIS_HASH, computeEntryHash } from './lib/history-manager';
+import { WebSocketManager, WebSocketConfig, AccountUpdate, createVaultMonitor } from './lib/websocket-manager';
+import { RealtimeTracker, RealtimeTrackerConfig, BalanceSnapshot } from './lib/realtime-tracker';
 import {
   TokenConfig,
   TokenStats,
@@ -59,6 +61,17 @@ export {
   BondingCurveData,
   deserializeBondingCurve,
   RetryConfig
+};
+
+// Re-export WebSocket modules
+export {
+  WebSocketManager,
+  WebSocketConfig,
+  AccountUpdate,
+  createVaultMonitor,
+  RealtimeTracker,
+  RealtimeTrackerConfig,
+  BalanceSnapshot
 };
 
 // Re-export HistoryEventType locally if needed or import

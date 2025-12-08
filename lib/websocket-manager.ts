@@ -83,11 +83,8 @@ export class WebSocketManager extends EventEmitter {
     this.emit('connecting');
 
     try {
-      // Create WebSocket connection
-      this.wsConnection = new Connection(this.config.wsUrl, {
-        commitment: this.config.commitment,
-        wsEndpoint: this.config.wsUrl,
-      });
+      // Use the HTTP connection - it handles WebSocket internally for subscriptions
+      this.wsConnection = this.connection;
 
       // Test connection with a slot query
       await this.wsConnection.getSlot();

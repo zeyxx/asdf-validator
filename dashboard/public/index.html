@@ -12,9 +12,17 @@
     <!-- Header -->
     <header>
       <h1>ASDF Validator</h1>
-      <div class="status">
-        <span id="ws-status" class="status-indicator disconnected"></span>
-        <span id="ws-text">Connecting...</span>
+      <div class="header-controls">
+        <button id="theme-toggle" class="icon-btn" title="Toggle theme">
+          <span class="theme-icon">&#9790;</span>
+        </button>
+        <button id="pause-toggle" class="icon-btn" title="Pause updates">
+          <span class="pause-icon">&#9208;</span>
+        </button>
+        <div class="status">
+          <span id="ws-status" class="status-indicator disconnected"></span>
+          <span id="ws-text">Connecting...</span>
+        </div>
       </div>
     </header>
 
@@ -53,11 +61,22 @@
         <div class="stat-value" id="orphan-fees">0.000000</div>
         <div class="stat-unit">SOL (<span id="orphan-count">0</span> events)</div>
       </div>
+      <div class="stat-card fee-rate">
+        <div class="stat-label">Fee Rate</div>
+        <div class="stat-value" id="fee-rate">0.000000</div>
+        <div class="stat-unit">SOL/min</div>
+      </div>
     </div>
+
+    <!-- Alerts Container -->
+    <div id="alerts-container" class="alerts-container"></div>
 
     <!-- Tokens Table -->
     <div class="tokens-section">
-      <h2>Fees by Token</h2>
+      <div class="section-header">
+        <h2>Fees by Token</h2>
+        <input type="text" id="token-filter" placeholder="Filter by symbol or mint..." class="filter-input">
+      </div>
       <div class="tokens-table-container">
         <table id="tokens-table">
           <thead>

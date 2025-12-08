@@ -10,6 +10,13 @@ let orphanFeeCount = 0;
 let chartData = [];
 const MAX_CHART_POINTS = 60;
 
+// TIER 2: Analytics state
+let isPaused = false;
+let allTokens = []; // Store all tokens for filtering
+let feeTimestamps = []; // Track fee timestamps for rate calculation
+const FEE_RATE_WINDOW = 5 * 60 * 1000; // 5 minute window for rate calculation
+const ALERT_THRESHOLD = 0.1; // Alert when single fee > 0.1 SOL
+
 // DOM elements
 const wsStatus = document.getElementById('ws-status');
 const wsText = document.getElementById('ws-text');
@@ -23,6 +30,13 @@ const orphanCountEl = document.getElementById('orphan-count');
 const feesTbody = document.getElementById('fees-tbody');
 const tokensTbody = document.getElementById('tokens-tbody');
 const lastUpdateEl = document.getElementById('last-update');
+
+// TIER 2: New DOM elements
+const feeRateEl = document.getElementById('fee-rate');
+const themeToggle = document.getElementById('theme-toggle');
+const pauseToggle = document.getElementById('pause-toggle');
+const tokenFilter = document.getElementById('token-filter');
+const alertsContainer = document.getElementById('alerts-container');
 
 // Chart setup
 const ctx = document.getElementById('fees-chart').getContext('2d');
@@ -162,28 +176,20 @@ function updateChart(fees) {
   chart.update('none');
 }
 
-// Update tokens table
+// Update tokens table (now uses allTokens for filtering)
 function updateTokensTable(tokens) {
   if (!tokens || tokens.length === 0) return;
 
-  tokensTbody.innerHTML = '';
-  tokens.forEach(token => {
-    const row = document.createElement('tr');
-    row.className = 'token-row';
-    const shortMint = token.mint.substring(0, 4) + '...' + token.mint.substring(token.mint.length - 4);
-    const status = token.migrated ? 'AMM' : 'BC';
-    const statusClass = token.migrated ? 'migrated' : 'active';
-    const displayName = token.name || token.symbol || '-';
-    row.innerHTML = `
-      <td class="token-symbol">${token.symbol}</td>
-      <td class="token-name">${displayName}</td>
-      <td class="token-mint" title="${token.mint}">${shortMint}</td>
-      <td class="token-fees">${token.totalFees} SOL</td>
-      <td class="token-count">${token.feeCount}</td>
-      <td class="token-status ${statusClass}">${status}</td>
-    `;
-    tokensTbody.appendChild(row);
-  });
+  // Store all tokens for filtering
+  allTokens = tokens;
+
+  // Check if there's a filter active
+  const filterValue = tokenFilter ? tokenFilter.value : '';
+  if (filterValue) {
+    filterTokens(filterValue);
+  } else {
+    renderTokensTable(tokens);
+  }
 }
 
 // Add fee to table
@@ -233,6 +239,11 @@ function updateLastUpdate() {
 // Handle WebSocket messages
 function handleMessage(event) {
   const message = JSON.parse(event.data);
+
+  // Skip updates if paused (except initial state and status)
+  if (isPaused && message.type !== 'state' && message.type !== 'status') {
+    return;
+  }
 
   switch (message.type) {
     case 'state':
@@ -290,6 +301,10 @@ function handleMessage(event) {
         orphanFees = parseFloat(fee.orphanFees);
         orphanFeeCount = fee.orphanFeeCount;
       }
+
+      // TIER 2: Update fee rate and check threshold
+      updateFeeRate(fee.amount, fee.timestamp);
+      checkFeeThreshold(fee.amount);
 
       addFeeToTable(fee);
       updateChart(fee.totalFees);
@@ -357,12 +372,150 @@ function connect() {
   };
 }
 
+// ============================================
+// TIER 2: Analytics Functions
+// ============================================
+
+// Theme toggle
+function initTheme() {
+  const savedTheme = localStorage.getItem('dashboard-theme');
+  if (savedTheme === 'light') {
+    document.body.classList.add('light-theme');
+    themeToggle.querySelector('.theme-icon').innerHTML = '&#9728;'; // Sun
+  }
+}
+
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light-theme');
+  localStorage.setItem('dashboard-theme', isLight ? 'light' : 'dark');
+  themeToggle.querySelector('.theme-icon').innerHTML = isLight ? '&#9728;' : '&#9790;';
+
+  // Update charts for new theme
+  updateChartsTheme(isLight);
+}
+
+function updateChartsTheme(isLight) {
+  const gridColor = isLight ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255, 255, 255, 0.1)';
+  const tickColor = isLight ? '#666' : '#888';
+
+  chart.options.scales.x.grid.color = gridColor;
+  chart.options.scales.y.grid.color = gridColor;
+  chart.options.scales.x.ticks.color = tickColor;
+  chart.options.scales.y.ticks.color = tickColor;
+  chart.update('none');
+
+  hourlyChart.options.scales.x.grid.color = gridColor;
+  hourlyChart.options.scales.y.grid.color = gridColor;
+  hourlyChart.options.scales.x.ticks.color = tickColor;
+  hourlyChart.options.scales.y.ticks.color = tickColor;
+  hourlyChart.update('none');
+}
+
+// Pause/Resume toggle
+function togglePause() {
+  isPaused = !isPaused;
+  document.body.classList.toggle('paused', isPaused);
+  pauseToggle.classList.toggle('active', isPaused);
+  pauseToggle.querySelector('.pause-icon').innerHTML = isPaused ? '&#9654;' : '&#9208;';
+  pauseToggle.title = isPaused ? 'Resume updates' : 'Pause updates';
+
+  if (isPaused) {
+    showAlert('Updates paused', 'info');
+  }
+}
+
+// Fee rate calculation
+function updateFeeRate(amount, timestamp) {
+  feeTimestamps.push({ amount: parseFloat(amount), timestamp });
+
+  // Remove old timestamps outside window
+  const cutoff = Date.now() - FEE_RATE_WINDOW;
+  feeTimestamps = feeTimestamps.filter(f => f.timestamp > cutoff);
+
+  // Calculate rate (SOL per minute)
+  const totalInWindow = feeTimestamps.reduce((sum, f) => sum + f.amount, 0);
+  const windowMinutes = FEE_RATE_WINDOW / 60000;
+  const rate = totalInWindow / windowMinutes;
+
+  feeRateEl.textContent = rate.toFixed(6);
+}
+
+// Token filtering
+function filterTokens(searchTerm) {
+  const filtered = allTokens.filter(token => {
+    const term = searchTerm.toLowerCase();
+    return token.symbol.toLowerCase().includes(term) ||
+           token.mint.toLowerCase().includes(term) ||
+           (token.name && token.name.toLowerCase().includes(term));
+  });
+  renderTokensTable(filtered);
+}
+
+function renderTokensTable(tokens) {
+  if (!tokens || tokens.length === 0) {
+    tokensTbody.innerHTML = '<tr class="empty-row"><td colspan="6">No tokens found</td></tr>';
+    return;
+  }
+
+  tokensTbody.innerHTML = '';
+  tokens.forEach(token => {
+    const row = document.createElement('tr');
+    row.className = 'token-row';
+    const shortMint = token.mint.substring(0, 4) + '...' + token.mint.substring(token.mint.length - 4);
+    const status = token.migrated ? 'AMM' : 'BC';
+    const statusClass = token.migrated ? 'migrated' : 'active';
+    const displayName = token.name || token.symbol || '-';
+    row.innerHTML = `
+      <td class="token-symbol">${token.symbol}</td>
+      <td class="token-name">${displayName}</td>
+      <td class="token-mint" title="${token.mint}">${shortMint}</td>
+      <td class="token-fees">${token.totalFees} SOL</td>
+      <td class="token-count">${token.feeCount}</td>
+      <td class="token-status ${statusClass}">${status}</td>
+    `;
+    tokensTbody.appendChild(row);
+  });
+}
+
+// Alerts system
+function showAlert(message, type = 'info', duration = 5000) {
+  const alert = document.createElement('div');
+  alert.className = `alert ${type}`;
+  alert.innerHTML = `
+    <span>${message}</span>
+    <button class="alert-close" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  alertsContainer.appendChild(alert);
+
+  if (duration > 0) {
+    setTimeout(() => alert.remove(), duration);
+  }
+}
+
+function checkFeeThreshold(amount) {
+  const feeAmount = parseFloat(amount);
+  if (feeAmount >= ALERT_THRESHOLD) {
+    showAlert(`Large fee detected: ${amount} SOL`, 'warning', 10000);
+  }
+}
+
+// Event listeners
+themeToggle.addEventListener('click', toggleTheme);
+pauseToggle.addEventListener('click', togglePause);
+tokenFilter.addEventListener('input', (e) => filterTokens(e.target.value));
+
+// Initialize theme on load
+initTheme();
+
 // Start
 connect();
 
-// Update time every second
+// Update fee rate every 10 seconds
 setInterval(() => {
-  if (lastUpdateEl.textContent !== '-') {
-    // Already have an update, don't change
-  }
-}, 1000);
+  // Clean old timestamps and recalculate
+  const cutoff = Date.now() - FEE_RATE_WINDOW;
+  feeTimestamps = feeTimestamps.filter(f => f.timestamp > cutoff);
+  const totalInWindow = feeTimestamps.reduce((sum, f) => sum + f.amount, 0);
+  const rate = totalInWindow / (FEE_RATE_WINDOW / 60000);
+  feeRateEl.textContent = rate.toFixed(6);
+}, 10000);

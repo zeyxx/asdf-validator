@@ -8,6 +8,7 @@ module.exports = {
     'index.ts',
     'daemon.ts',
     'cli.ts',
+    'lib/**/*.ts',
     '!**/node_modules/**',
   ],
   coverageThreshold: {

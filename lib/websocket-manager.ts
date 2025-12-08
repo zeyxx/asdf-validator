@@ -26,11 +26,21 @@ export interface LogUpdate {
 
 type WebSocketState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
+interface SubscriptionInfo {
+  id: number;
+  callback: (update: AccountUpdate) => void;
+}
+
+interface LogSubscriptionInfo {
+  id: number;
+  callback: (update: LogUpdate) => void;
+}
+
 export class WebSocketManager extends EventEmitter {
   private connection: Connection;
   private wsConnection: Connection | null = null;
-  private subscriptions: Map<string, number> = new Map();
-  private logSubscriptions: Map<string, number> = new Map();
+  private subscriptions: Map<string, SubscriptionInfo> = new Map();
+  private logSubscriptions: Map<string, LogSubscriptionInfo> = new Map();
   private state: WebSocketState = 'disconnected';
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -129,7 +139,7 @@ export class WebSocketManager extends EventEmitter {
 
     const key = pubkey.toBase58();
     if (this.subscriptions.has(key)) {
-      return this.subscriptions.get(key)!;
+      return this.subscriptions.get(key)!.id;
     }
 
     const subscriptionId = this.wsConnection.onAccountChange(
@@ -147,7 +157,8 @@ export class WebSocketManager extends EventEmitter {
       this.config.commitment
     );
 
-    this.subscriptions.set(key, subscriptionId);
+    // Store subscription with callback for reconnection
+    this.subscriptions.set(key, { id: subscriptionId, callback });
     this.emit('subscribed', { type: 'account', pubkey, subscriptionId });
 
     return subscriptionId;
@@ -166,7 +177,7 @@ export class WebSocketManager extends EventEmitter {
 
     const key = `logs:${programId.toBase58()}`;
     if (this.logSubscriptions.has(key)) {
-      return this.logSubscriptions.get(key)!;
+      return this.logSubscriptions.get(key)!.id;
     }
 
     const subscriptionId = this.wsConnection.onLogs(
@@ -185,7 +196,8 @@ export class WebSocketManager extends EventEmitter {
       this.config.commitment
     );
 
-    this.logSubscriptions.set(key, subscriptionId);
+    // Store subscription with callback for reconnection
+    this.logSubscriptions.set(key, { id: subscriptionId, callback });
     this.emit('subscribed', { type: 'logs', programId, subscriptionId });
 
     return subscriptionId;
@@ -196,12 +208,12 @@ export class WebSocketManager extends EventEmitter {
    */
   async unsubscribeFromAccount(pubkey: PublicKey): Promise<void> {
     const key = pubkey.toBase58();
-    const subscriptionId = this.subscriptions.get(key);
+    const subInfo = this.subscriptions.get(key);
 
-    if (subscriptionId !== undefined && this.wsConnection) {
-      await this.wsConnection.removeAccountChangeListener(subscriptionId);
+    if (subInfo !== undefined && this.wsConnection) {
+      await this.wsConnection.removeAccountChangeListener(subInfo.id);
       this.subscriptions.delete(key);
-      this.emit('unsubscribed', { type: 'account', pubkey, subscriptionId });
+      this.emit('unsubscribed', { type: 'account', pubkey, subscriptionId: subInfo.id });
     }
   }
 
@@ -210,40 +222,44 @@ export class WebSocketManager extends EventEmitter {
    */
   async unsubscribeFromLogs(programId: PublicKey): Promise<void> {
     const key = `logs:${programId.toBase58()}`;
-    const subscriptionId = this.logSubscriptions.get(key);
+    const subInfo = this.logSubscriptions.get(key);
 
-    if (subscriptionId !== undefined && this.wsConnection) {
-      await this.wsConnection.removeOnLogsListener(subscriptionId);
+    if (subInfo !== undefined && this.wsConnection) {
+      await this.wsConnection.removeOnLogsListener(subInfo.id);
       this.logSubscriptions.delete(key);
-      this.emit('unsubscribed', { type: 'logs', programId, subscriptionId });
+      this.emit('unsubscribed', { type: 'logs', programId, subscriptionId: subInfo.id });
     }
   }
 
   /**
-   * Unsubscribe from all
+   * Unsubscribe from all (but keep callback info for resubscription)
+   * @param clearCallbacks - If true, also clears stored callbacks (for full disconnect)
    */
-  async unsubscribeAll(): Promise<void> {
+  async unsubscribeAll(clearCallbacks: boolean = true): Promise<void> {
     if (!this.wsConnection) return;
 
     // Account subscriptions
-    for (const [key, subscriptionId] of this.subscriptions) {
+    for (const [key, subInfo] of this.subscriptions) {
       try {
-        await this.wsConnection.removeAccountChangeListener(subscriptionId);
+        await this.wsConnection.removeAccountChangeListener(subInfo.id);
       } catch (e) {
         // Ignore errors during cleanup
       }
     }
-    this.subscriptions.clear();
 
     // Log subscriptions
-    for (const [key, subscriptionId] of this.logSubscriptions) {
+    for (const [key, subInfo] of this.logSubscriptions) {
       try {
-        await this.wsConnection.removeOnLogsListener(subscriptionId);
+        await this.wsConnection.removeOnLogsListener(subInfo.id);
       } catch (e) {
         // Ignore errors during cleanup
       }
     }
-    this.logSubscriptions.clear();
+
+    if (clearCallbacks) {
+      this.subscriptions.clear();
+      this.logSubscriptions.clear();
+    }
   }
 
   /**
@@ -274,20 +290,80 @@ export class WebSocketManager extends EventEmitter {
 
   /**
    * Resubscribe to all accounts after reconnection
+   * Uses stored callbacks to automatically restore subscriptions
    */
   private async resubscribeAll(): Promise<void> {
-    const oldSubscriptions = new Map(this.subscriptions);
-    this.subscriptions.clear();
+    if (!this.wsConnection) return;
 
-    for (const key of oldSubscriptions.keys()) {
-      const pubkey = new PublicKey(key);
-      // Note: We can't restore the original callback here
-      // The caller should resubscribe with their callbacks
+    // Store old subscription info (with callbacks)
+    const oldAccountSubs = new Map(this.subscriptions);
+    const oldLogSubs = new Map(this.logSubscriptions);
+
+    // Clear old subscription IDs (but callbacks are still in the old maps)
+    this.subscriptions.clear();
+    this.logSubscriptions.clear();
+
+    let restoredAccounts = 0;
+    let restoredLogs = 0;
+
+    // Resubscribe to account changes
+    for (const [key, subInfo] of oldAccountSubs) {
+      try {
+        const pubkey = new PublicKey(key);
+        const newId = this.wsConnection.onAccountChange(
+          pubkey,
+          (accountInfo: AccountInfo<Buffer>, context: Context) => {
+            const update: AccountUpdate = {
+              pubkey,
+              accountInfo,
+              context,
+              timestamp: Date.now(),
+            };
+            this.emit('accountUpdate', update);
+            subInfo.callback(update);
+          },
+          this.config.commitment
+        );
+        this.subscriptions.set(key, { id: newId, callback: subInfo.callback });
+        restoredAccounts++;
+      } catch (error) {
+        this.emit('resubscriptionError', { type: 'account', key, error });
+      }
     }
 
-    this.emit('resubscriptionRequired', {
-      accounts: Array.from(oldSubscriptions.keys()),
-      logs: Array.from(this.logSubscriptions.keys()),
+    // Resubscribe to program logs
+    for (const [key, subInfo] of oldLogSubs) {
+      try {
+        // Extract programId from key (format: "logs:<pubkey>")
+        const programIdStr = key.replace('logs:', '');
+        const programId = new PublicKey(programIdStr);
+        const newId = this.wsConnection.onLogs(
+          programId,
+          (logs: Logs, context: Context) => {
+            const update: LogUpdate = {
+              signature: logs.signature,
+              logs: logs.logs,
+              err: logs.err,
+              context,
+              timestamp: Date.now(),
+            };
+            this.emit('logUpdate', update);
+            subInfo.callback(update);
+          },
+          this.config.commitment
+        );
+        this.logSubscriptions.set(key, { id: newId, callback: subInfo.callback });
+        restoredLogs++;
+      } catch (error) {
+        this.emit('resubscriptionError', { type: 'logs', key, error });
+      }
+    }
+
+    this.emit('resubscribed', {
+      accounts: restoredAccounts,
+      logs: restoredLogs,
+      totalAccounts: oldAccountSubs.size,
+      totalLogs: oldLogSubs.size,
     });
   }
 

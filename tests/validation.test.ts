@@ -11,6 +11,7 @@ import {
   validateHistoryLog,
   validatePollInterval,
   GENESIS_HASH,
+  TRUSTED_RPC_DOMAINS,
 } from '../daemon';
 
 describe('Input Validation', () => {
@@ -20,9 +21,22 @@ describe('Input Validation', () => {
       expect(result.valid).toBe(true);
     });
 
-    it('should accept valid HTTP URL', () => {
-      const result = validateRpcUrl('http://localhost:8899');
+    it('should accept valid HTTP URL (non-localhost)', () => {
+      const result = validateRpcUrl('http://example-rpc.com:8899');
       expect(result.valid).toBe(true);
+    });
+
+    it('should reject localhost URLs (SSRF protection)', () => {
+      const result = validateRpcUrl('http://localhost:8899');
+      expect(result.valid).toBe(false);
+      expect(result.error).toContain('internal/private');
+    });
+
+    it('should reject private IP addresses', () => {
+      expect(validateRpcUrl('http://192.168.1.1').valid).toBe(false);
+      expect(validateRpcUrl('http://10.0.0.1').valid).toBe(false);
+      expect(validateRpcUrl('http://172.16.0.1').valid).toBe(false);
+      expect(validateRpcUrl('http://127.0.0.1').valid).toBe(false);
     });
 
     it('should accept URL with port', () => {
@@ -62,6 +76,38 @@ describe('Input Validation', () => {
       const result = validateRpcUrl('wss://api.mainnet-beta.solana.com');
       expect(result.valid).toBe(false);
       expect(result.error).toContain('protocol');
+    });
+
+    describe('strict mode', () => {
+      it('should accept trusted domain in strict mode', () => {
+        const result = validateRpcUrl('https://api.mainnet-beta.solana.com', { strict: true });
+        expect(result.valid).toBe(true);
+      });
+
+      it('should accept subdomain of trusted domain', () => {
+        const result = validateRpcUrl('https://my-app.rpc.helius.xyz', { strict: true });
+        expect(result.valid).toBe(true);
+      });
+
+      it('should reject unknown domain in strict mode', () => {
+        const result = validateRpcUrl('https://unknown-rpc.example.com', { strict: true });
+        expect(result.valid).toBe(false);
+        expect(result.error).toContain('trusted list');
+      });
+
+      it('should accept custom domain with additionalDomains', () => {
+        const result = validateRpcUrl('https://my-custom-rpc.io', {
+          strict: true,
+          additionalDomains: ['my-custom-rpc.io']
+        });
+        expect(result.valid).toBe(true);
+      });
+
+      it('should have correct trusted domains count', () => {
+        expect(TRUSTED_RPC_DOMAINS.length).toBeGreaterThan(5);
+        expect(TRUSTED_RPC_DOMAINS).toContain('api.mainnet-beta.solana.com');
+        expect(TRUSTED_RPC_DOMAINS).toContain('rpc.helius.xyz');
+      });
     });
   });
 

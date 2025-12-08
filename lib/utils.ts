@@ -28,6 +28,7 @@ export interface FeeRecord {
 export interface TokenStats {
   mint: string;
   symbol: string;
+  name?: string;
   totalFees: bigint;
   feeCount: number;
   lastFeeTimestamp: number;
@@ -49,6 +50,7 @@ export interface BondingCurveData {
 export interface TrackedToken {
   mint: string;
   symbol: string;
+  name?: string;
   bondingCurve: string;
   ammPool: string;
   migrated: boolean;
@@ -333,7 +335,30 @@ export function validateSolanaAddress(address: string): ValidationResult {
   }
 }
 
-export function validateRpcUrl(url: string): ValidationResult {
+// Trusted RPC domains for strict validation (prevents SSRF)
+export const TRUSTED_RPC_DOMAINS = [
+  'api.mainnet-beta.solana.com',
+  'api.devnet.solana.com',
+  'api.testnet.solana.com',
+  'mainnet.helius-rpc.com',
+  'rpc.helius.xyz',
+  'solana-mainnet.g.alchemy.com',
+  'solana-devnet.g.alchemy.com',
+  'mainnet.rpcpool.com',
+  'devnet.rpcpool.com',
+  'api.quicknode.com',
+  'rpc.ankr.com',
+  'solana.public-rpc.com',
+];
+
+export interface RpcValidationOptions {
+  /** If true, only allow URLs from TRUSTED_RPC_DOMAINS */
+  strict?: boolean;
+  /** Additional domains to allow (only used when strict=true) */
+  additionalDomains?: string[];
+}
+
+export function validateRpcUrl(url: string, options: RpcValidationOptions = {}): ValidationResult {
   if (!url || typeof url !== 'string') {
     return { valid: false, error: 'RPC URL is required' };
   }
@@ -345,6 +370,44 @@ export function validateRpcUrl(url: string): ValidationResult {
     if (!parsed.host) {
       return { valid: false, error: 'RPC URL must have a valid host' };
     }
+
+    // Strict mode: check against whitelist
+    if (options.strict) {
+      const allowedDomains = [...TRUSTED_RPC_DOMAINS, ...(options.additionalDomains || [])];
+      const hostname = parsed.hostname.toLowerCase();
+
+      const isTrusted = allowedDomains.some(domain => {
+        const domainLower = domain.toLowerCase();
+        // Match exact domain or subdomain
+        return hostname === domainLower || hostname.endsWith('.' + domainLower);
+      });
+
+      if (!isTrusted) {
+        return {
+          valid: false,
+          error: `RPC URL domain not in trusted list. Use a known provider or disable strict mode.`
+        };
+      }
+    }
+
+    // Block obvious dangerous patterns
+    const dangerousPatterns = [
+      /^localhost$/i,
+      /^127\.\d+\.\d+\.\d+$/,
+      /^10\.\d+\.\d+\.\d+$/,
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+$/,
+      /^192\.168\.\d+\.\d+$/,
+      /^0\.0\.0\.0$/,
+      /^\[::1\]$/,
+      /^169\.254\.\d+\.\d+$/, // Link-local
+    ];
+
+    for (const pattern of dangerousPatterns) {
+      if (pattern.test(parsed.hostname)) {
+        return { valid: false, error: 'RPC URL cannot point to internal/private network addresses' };
+      }
+    }
+
     return { valid: true };
   } catch {
     return { valid: false, error: 'Invalid RPC URL format' };

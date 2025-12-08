@@ -13,7 +13,9 @@ import {
   GENESIS_HASH,
   HistoryEntry,
   HistoryLog,
+  ChainValidationResult,
 } from '../daemon';
+import { HistoryManager } from '../lib/history-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -576,6 +578,134 @@ describe('Proof-of-History', () => {
       fs.unlinkSync(nestedPath);
       fs.rmdirSync(`${testDir}/nested/deep`);
       fs.rmdirSync(`${testDir}/nested`);
+    });
+  });
+
+  describe('HistoryManager chain validation at init', () => {
+    const testDir = '/tmp/asdf-validator-test-hm';
+    const testFile = `${testDir}/history-validation.jsonl`;
+
+    beforeEach(() => {
+      // Ensure clean state
+      if (fs.existsSync(testFile)) {
+        fs.unlinkSync(testFile);
+      }
+      if (!fs.existsSync(testDir)) {
+        fs.mkdirSync(testDir, { recursive: true });
+      }
+    });
+
+    afterAll(() => {
+      // Cleanup
+      if (fs.existsSync(testFile)) {
+        fs.unlinkSync(testFile);
+      }
+      if (fs.existsSync(testDir)) {
+        fs.rmdirSync(testDir, { recursive: true });
+      }
+    });
+
+    it('should report valid chain for new empty file', async () => {
+      const hm = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm.init();
+
+      const validation = hm.getChainValidation();
+      expect(validation.valid).toBe(true);
+      expect(validation.entriesChecked).toBe(0);
+
+      hm.close();
+    });
+
+    it('should validate chain correctly after adding entries', async () => {
+      const hm = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm.init();
+
+      // Add valid entries
+      hm.addEntry('FEE', 'BC', 'BCVault', 1000000000n, 0n, 1000000000n, 100, Date.now());
+      hm.addEntry('FEE', 'AMM', 'AMMVault', 500000000n, 1000000000n, 1500000000n, 101, Date.now());
+
+      hm.close();
+
+      // Wait for stream to flush
+      await new Promise(r => setTimeout(r, 50));
+
+      // Re-open and validate
+      const hm2 = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm2.init();
+
+      const validation = hm2.getChainValidation();
+      expect(validation.valid).toBe(true);
+      expect(validation.entriesChecked).toBe(2);
+      expect(hm2.isChainValid()).toBe(true);
+
+      hm2.close();
+    });
+
+    it('should detect corrupted hash at init', async () => {
+      // Create a valid file first
+      const hm = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm.init();
+      hm.addEntry('FEE', 'BC', 'BCVault', 1000000000n, 0n, 1000000000n, 100, Date.now());
+      hm.close();
+
+      // Wait for stream to flush
+      await new Promise(r => setTimeout(r, 50));
+
+      // Tamper with the file - corrupt the hash
+      let content = fs.readFileSync(testFile, 'utf-8');
+      content = content.replace(/"hash":"[a-f0-9]+"/g, '"hash":"corrupted_hash_value"');
+      fs.writeFileSync(testFile, content);
+
+      // Re-open and validate - should detect corruption
+      const hm2 = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm2.init();
+
+      const validation = hm2.getChainValidation();
+      expect(validation.valid).toBe(false);
+      expect(validation.error).toContain('Invalid hash');
+      expect(validation.corruptedAtSequence).toBe(1);
+      expect(hm2.isChainValid()).toBe(false);
+
+      hm2.close();
+    });
+
+    it('should detect broken chain linkage at init', async () => {
+      // Create entries and manually break the chain
+      const hm = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm.init();
+      hm.addEntry('FEE', 'BC', 'BCVault', 1000000000n, 0n, 1000000000n, 100, Date.now());
+      hm.addEntry('FEE', 'AMM', 'AMMVault', 500000000n, 1000000000n, 1500000000n, 101, Date.now());
+      hm.close();
+
+      // Wait for stream to flush
+      await new Promise(r => setTimeout(r, 50));
+
+      // Tamper: change prevHash of second entry
+      let content = fs.readFileSync(testFile, 'utf-8');
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes('"sequence":2')) {
+          // Break the prevHash link
+          lines[i] = lines[i].replace(/"prevHash":"[a-f0-9]+"/, '"prevHash":"broken_link"');
+          // Recompute the hash to match the new data (so it passes hash check but fails chain check)
+          const record = JSON.parse(lines[i]);
+          const entry = record.data;
+          const newHash = computeEntryHash(entry);
+          lines[i] = lines[i].replace(/"hash":"[a-f0-9]+"/, `"hash":"${newHash}"`);
+        }
+      }
+      fs.writeFileSync(testFile, lines.join('\n'));
+
+      // Re-open and validate
+      const hm2 = new HistoryManager(testFile, 'Creator', 'BCVault', 'AMMVault');
+      await hm2.init();
+
+      const validation = hm2.getChainValidation();
+      expect(validation.valid).toBe(false);
+      expect(validation.error).toContain('prevHash mismatch');
+      expect(validation.corruptedAtSequence).toBe(2);
+
+      hm2.close();
     });
   });
 });

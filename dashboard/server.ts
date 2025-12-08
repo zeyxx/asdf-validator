@@ -18,9 +18,21 @@ import {
   deriveBondingCurveVault,
   derivePumpSwapVault,
   FeeRecord,
+  TokenManager,
+  RpcManager,
 } from '../daemon';
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
+
+interface TokenStatsDisplay {
+  mint: string;
+  symbol: string;
+  name?: string;
+  totalFees: string;
+  feeCount: number;
+  lastFeeTimestamp: number;
+  migrated: boolean;
+}
 
 interface DashboardState {
   creator: string;
@@ -36,7 +48,10 @@ interface DashboardState {
     vault: string;
     timestamp: number;
     slot: number;
+    mint?: string;
+    symbol?: string;
   }>;
+  tokens: TokenStatsDisplay[];
   connected: boolean;
 }
 
@@ -77,8 +92,22 @@ const state: DashboardState = {
   feeCount: 0,
   lastUpdate: Date.now(),
   recentFees: [],
+  tokens: [],
   connected: false,
 };
+
+// Helper to update token stats
+function updateTokenStats() {
+  state.tokens = tracker.getStats().map(s => ({
+    mint: s.mint,
+    symbol: s.symbol,
+    name: s.name,
+    totalFees: formatSol(s.totalFees),
+    feeCount: s.feeCount,
+    lastFeeTimestamp: s.lastFeeTimestamp,
+    migrated: s.migrated || false,
+  })).sort((a, b) => parseFloat(b.totalFees) - parseFloat(a.totalFees));
+}
 
 // Create Express app
 const app = express();
@@ -101,9 +130,56 @@ app.get('/api/config', (req, res) => {
     creator: state.creator,
     bcVault: state.bcVault,
     ammVault: state.ammVault,
-    rpcUrl: rpcUrl.substring(0, 50) + '...',
+    // RPC URL is not exposed for security reasons
   });
 });
+
+// Health check endpoint
+const startTime = Date.now();
+app.get('/health', (req, res) => {
+  const uptimeMs = Date.now() - startTime;
+  const memUsage = process.memoryUsage();
+
+  const healthData = {
+    status: state.connected ? 'healthy' : 'degraded',
+    uptime: {
+      ms: uptimeMs,
+      formatted: formatUptime(uptimeMs),
+    },
+    websocket: {
+      connected: state.connected,
+      clients: clients.size,
+    },
+    tracker: {
+      running: tracker.isRunning(),
+      updateCount: tracker.getUpdateCount(),
+      feeCount: state.feeCount,
+    },
+    memory: {
+      heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+      rss: Math.round(memUsage.rss / 1024 / 1024),
+      unit: 'MB',
+    },
+    timestamp: new Date().toISOString(),
+  };
+
+  // Return 200 for healthy/degraded, 503 for down
+  const statusCode = state.connected ? 200 : 503;
+  res.status(statusCode).json(healthData);
+});
+
+function formatUptime(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
 
 // WebSocket handling
 wss.on('connection', (ws) => {
@@ -145,12 +221,17 @@ const tracker = new RealtimeTracker({
     state.totalFees = formatSol(tracker.getTotalFees());
     state.lastUpdate = Date.now();
 
+    // Update token stats
+    updateTokenStats();
+
     // Add to recent fees (keep last 50)
     state.recentFees.unshift({
       amount: formatSol(record.amount),
       vault: record.symbol,
       timestamp: record.timestamp,
       slot: record.slot,
+      mint: record.mint,
+      symbol: record.symbol,
     });
     if (state.recentFees.length > 50) {
       state.recentFees.pop();
@@ -163,8 +244,11 @@ const tracker = new RealtimeTracker({
         vault: record.symbol,
         timestamp: record.timestamp,
         slot: record.slot,
+        mint: record.mint,
+        symbol: record.symbol,
         totalFees: state.totalFees,
         feeCount: state.feeCount,
+        tokens: state.tokens,
       },
     });
   },
@@ -216,6 +300,47 @@ async function start() {
   console.log(`BC Vault:  ${bcVault.toBase58()}`);
   console.log(`AMM Vault: ${ammVault.toBase58()}`);
   console.log('');
+
+  // Discover tokens created by this creator
+  console.log('Discovering tokens...');
+  const rpcManager = new RpcManager(rpcUrl);
+  const tokenManager = new TokenManager(rpcManager);
+
+  try {
+    const discoveredTokens = await tokenManager.discoverTokens(creator);
+    console.log(`Found ${discoveredTokens.length} tokens`);
+
+    for (const token of discoveredTokens) {
+      if (!token.mint) continue; // Skip tokens without mint
+      const mintStr = token.mint.toBase58();
+      const bcStr = token.bondingCurve.toBase58();
+      const symbol = mintStr.substring(0, 6);
+
+      tracker.addToken({
+        mint: mintStr,
+        symbol: symbol,
+        bondingCurve: bcStr,
+        ammPool: '',
+        migrated: token.migrated,
+        lastSolReserves: token.realSolReserves || 0n,
+        lastAmmReserves: 0n,
+        totalFees: 0n,
+        feeCount: 0,
+        recentAmmFees: 0n,
+        recentAmmFeesTimestamp: 0,
+        recentBcFees: 0n,
+        recentBcFeesTimestamp: 0,
+        isMayhemMode: token.isMayhemMode || false,
+        tokenProgram: 'TOKEN',
+      });
+      console.log(`  - ${symbol} (${token.migrated ? 'AMM' : 'BC'})`);
+    }
+
+    // Update state with discovered tokens
+    updateTokenStats();
+  } catch (error) {
+    console.log('Token discovery failed:', error);
+  }
 
   // Start tracker
   await tracker.start();

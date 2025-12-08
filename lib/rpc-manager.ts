@@ -1,4 +1,4 @@
-import { Connection, PublicKey, AccountInfo, ParsedAccountData } from '@solana/web3.js';
+import { Connection, PublicKey, AccountInfo, ParsedAccountData, VersionedTransactionResponse, ConfirmedSignatureInfo } from '@solana/web3.js';
 import { CircuitBreaker, fetchWithRetry, RetryConfig, DEFAULT_RETRY_CONFIG } from './utils';
 
 export class RpcManager {
@@ -20,6 +20,49 @@ export class RpcManager {
 
   getConnection(): Connection {
     return this.connection;
+  }
+
+  /**
+   * Get circuit breaker state for monitoring
+   */
+  getCircuitBreakerState(): { state: string; canExecute: boolean } {
+    return {
+      state: this.circuitBreaker.getState(),
+      canExecute: this.circuitBreaker.canExecute(),
+    };
+  }
+
+  /**
+   * Reset circuit breaker manually (e.g., after RPC recovery)
+   */
+  resetCircuitBreaker(): void {
+    this.circuitBreaker.reset();
+  }
+
+  /**
+   * Standardized method to execute RPC calls with circuit breaker and retry
+   * @throws Error if circuit breaker is open
+   */
+  private async executeWithCircuitBreaker<T>(
+    operation: () => Promise<T>,
+    operationName: string = 'RPC call'
+  ): Promise<T> {
+    if (!this.circuitBreaker.canExecute()) {
+      throw new Error(`Circuit breaker is OPEN - ${operationName} blocked. Try again later.`);
+    }
+
+    try {
+      const result = await fetchWithRetry(
+        operation,
+        this.retryConfig,
+        (attempt, error) => this.onRpcError?.(error, attempt)
+      );
+      this.circuitBreaker.recordSuccess();
+      return result;
+    } catch (error) {
+      this.circuitBreaker.recordFailure();
+      throw error;
+    }
   }
 
   async checkHealth(timeoutMs: number = 5000): Promise<{ healthy: boolean; latencyMs?: number; error?: string }> {
@@ -160,58 +203,68 @@ export class RpcManager {
 
   /**
    * Fetch a single account with retry
+   * @throws Error if circuit breaker is open
    */
   async getAccountInfo(publicKey: PublicKey): Promise<AccountInfo<Buffer> | null> {
-    if (!this.circuitBreaker.canExecute()) {
-      return null;
-    }
-
-    return fetchWithRetry(
-      async () => {
-        const res = await this.connection.getAccountInfo(publicKey);
-        this.circuitBreaker.recordSuccess();
-        return res;
-      },
-      this.retryConfig,
-      (attempt, error) => this.onRpcError?.(error, attempt)
+    return this.executeWithCircuitBreaker(
+      () => this.connection.getAccountInfo(publicKey),
+      'getAccountInfo'
     );
   }
 
   /**
    * Fetch balance with retry
+   * @throws Error if circuit breaker is open
    */
   async getBalance(publicKey: PublicKey): Promise<number> {
-    if (!this.circuitBreaker.canExecute()) {
-      throw new Error('Circuit breaker is OPEN');
-    }
-
-    return fetchWithRetry(
-      async () => {
-        const res = await this.connection.getBalance(publicKey);
-        this.circuitBreaker.recordSuccess();
-        return res;
-      },
-      this.retryConfig,
-      (attempt, error) => this.onRpcError?.(error, attempt)
+    return this.executeWithCircuitBreaker(
+      () => this.connection.getBalance(publicKey),
+      'getBalance'
     );
   }
 
   /**
    * Fetch token account balance with retry
+   * @throws Error if circuit breaker is open
    */
   async getTokenAccountBalance(publicKey: PublicKey): Promise<bigint> {
-    if (!this.circuitBreaker.canExecute()) {
-      throw new Error('Circuit breaker is OPEN');
-    }
-
-    return fetchWithRetry(
+    return this.executeWithCircuitBreaker(
       async () => {
         const res = await this.connection.getTokenAccountBalance(publicKey);
-        this.circuitBreaker.recordSuccess();
         return BigInt(res.value.amount);
       },
-      this.retryConfig,
-      (attempt, error) => this.onRpcError?.(error, attempt)
+      'getTokenAccountBalance'
+    );
+  }
+
+  /**
+   * Fetch recent signatures for an address
+   * @throws Error if circuit breaker is open
+   */
+  async getSignaturesForAddress(
+    address: PublicKey,
+    options: { limit?: number; before?: string; until?: string } = {}
+  ): Promise<ConfirmedSignatureInfo[]> {
+    return this.executeWithCircuitBreaker(
+      () => this.connection.getSignaturesForAddress(address, {
+        limit: options.limit || 10,
+        before: options.before,
+        until: options.until,
+      }),
+      'getSignaturesForAddress'
+    );
+  }
+
+  /**
+   * Fetch a transaction by signature
+   * @throws Error if circuit breaker is open
+   */
+  async getTransaction(signature: string): Promise<VersionedTransactionResponse | null> {
+    return this.executeWithCircuitBreaker(
+      () => this.connection.getTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+      }),
+      'getTransaction'
     );
   }
 }

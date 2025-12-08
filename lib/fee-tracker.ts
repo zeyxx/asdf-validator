@@ -31,6 +31,9 @@ interface TrackerState {
   lastAmmSignature: string | null;
   lastBcBalance: string; // BigInt as string
   lastAmmBalance: string; // BigInt as string
+  accumulatedBcDelta: string; // BigInt as string
+  accumulatedAmmDelta: string; // BigInt as string
+  totalOrphanFees: string; // BigInt as string
   trackedTokens: Record<string, any>; // Simplified serialization
 }
 
@@ -48,7 +51,11 @@ export class FeeTracker {
   private accumulatedAmmDelta: bigint = 0n;
   private totalOrphanFees: bigint = 0n;
   private pollCount: number = 0;
-  
+
+  // Idempotency protection - track processed signatures
+  private processedSignatures: Set<string> = new Set();
+  private static readonly MAX_PROCESSED_SIGNATURES = 10000;
+
   private trackedTokens: Map<string, TrackedToken> = new Map();
   private tokenStats: Map<string, TokenStats> = new Map();
 
@@ -117,8 +124,11 @@ export class FeeTracker {
         this.lastAmmSignature = data.lastAmmSignature;
         this.lastBcBalance = BigInt(data.lastBcBalance);
         this.lastAmmBalance = BigInt(data.lastAmmBalance);
-        // We don't restore trackedTokens fully here, relying on discovery/config
-        // But ideally we should restore token counters (recent fees etc)
+        // Restore accumulated deltas and orphan fees (new fields, backwards compatible)
+        this.accumulatedBcDelta = data.accumulatedBcDelta ? BigInt(data.accumulatedBcDelta) : 0n;
+        this.accumulatedAmmDelta = data.accumulatedAmmDelta ? BigInt(data.accumulatedAmmDelta) : 0n;
+        this.totalOrphanFees = data.totalOrphanFees ? BigInt(data.totalOrphanFees) : 0n;
+        this.log(`State restored: BC=${this.lastBcBalance}, AMM=${this.lastAmmBalance}, orphan=${this.totalOrphanFees}`);
       } catch (e) {
         console.warn('Failed to load state file:', e);
       }
@@ -179,7 +189,9 @@ export class FeeTracker {
               if (stats) stats.symbol = metadata.symbol;
               this.log(`Fetched metadata for ${token.mint}: ${metadata.symbol}`);
             }
-          }).catch(() => {});
+          }).catch((err) => {
+            this.log(`Failed to fetch metadata for ${token.mint}: ${err.message || err}`);
+          });
         }
       }
     }
@@ -273,9 +285,25 @@ export class FeeTracker {
 
     // Process transactions in chronological order (reverse)
     for (const sig of signatures.reverse()) {
+      // Idempotency check - skip already processed signatures
+      if (this.processedSignatures.has(sig)) {
+        if (this.config.verbose) console.log(`Skipping already processed signature: ${sig}`);
+        continue;
+      }
+
       try {
         const tx = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 });
         if (!tx || !tx.meta) continue;
+
+        // Mark as processed (before any processing to prevent race conditions)
+        this.processedSignatures.add(sig);
+
+        // FIFO eviction if Set is too large
+        if (this.processedSignatures.size > FeeTracker.MAX_PROCESSED_SIGNATURES) {
+          const iterator = this.processedSignatures.values();
+          const oldest = iterator.next().value;
+          if (oldest) this.processedSignatures.delete(oldest);
+        }
 
         const feeAmount = this.calculateFeeAmount(type, address, tx);
         netDelta += feeAmount;
@@ -405,7 +433,9 @@ export class FeeTracker {
                  const stats = this.tokenStats.get(token.mint);
                  if (stats) stats.symbol = metadata.symbol;
                }
-             }).catch(() => {});
+             }).catch((err) => {
+               this.log(`Failed to fetch metadata for new token ${mintStr}: ${err.message || err}`);
+             });
 
              this.addToken(token);
              if (this.config.onTokenDiscovered) {
@@ -603,6 +633,9 @@ export class FeeTracker {
       lastAmmSignature: this.lastAmmSignature,
       lastBcBalance: this.lastBcBalance.toString(),
       lastAmmBalance: this.lastAmmBalance.toString(),
+      accumulatedBcDelta: this.accumulatedBcDelta.toString(),
+      accumulatedAmmDelta: this.accumulatedAmmDelta.toString(),
+      totalOrphanFees: this.totalOrphanFees.toString(),
       trackedTokens: {} // We rely on discovery to re-populate full objects, but we could save stats here
     };
     fs.writeFileSync(this.config.stateFile, JSON.stringify(state));

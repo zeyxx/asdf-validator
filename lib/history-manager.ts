@@ -59,10 +59,18 @@ export function computeEntryHash(entry: Omit<HistoryEntry, 'hash'>): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
+export interface ChainValidationResult {
+  valid: boolean;
+  entriesChecked: number;
+  error?: string;
+  corruptedAtSequence?: number;
+}
+
 export class HistoryManager {
   private filePath: string;
   private metadata: HistoryMetadata;
   private writeStream: fs.WriteStream | null = null;
+  private chainValidation: ChainValidationResult = { valid: true, entriesChecked: 0 };
 
   constructor(
     filePath: string,
@@ -101,25 +109,23 @@ export class HistoryManager {
       fs.writeFileSync(this.filePath, JSON.stringify({ type: 'metadata', data: this.metadata }) + '\n');
     }
 
-    // Open append stream
+    // Open append stream with error handling
     this.writeStream = fs.createWriteStream(this.filePath, { flags: 'a' });
+    this.writeStream.on('error', (err) => {
+      console.error('[HistoryManager] WriteStream error:', err.message);
+    });
   }
 
   private async restoreState(): Promise<void> {
-    // Read file line by line to find metadata and last entry
-    // efficient for large files: we only need the first line (metadata) and verify the last line
-    // But to be 100% correct we should scan the whole file? For "restore", maybe just the header is enough if we trust the append only nature.
-    // However, we need 'latestHash' and 'entryCount' from the metadata which should be updated.
-    // Wait, in JSONL, the metadata is at the top. It doesn't get updated unless we rewrite the file.
-    // Solution: The metadata line at the top is the *initial* metadata. We need to scan the file to calculate current state.
-    // Or, we can append a "checkpoint" or "summary" line periodically?
-    // Let's scan the file. It's safe and robust.
-
+    // Read file line by line and validate the PoH chain integrity
     const fileStream = fs.createReadStream(this.filePath);
     const rl = require('readline').createInterface({
       input: fileStream,
       crlfDelay: Infinity,
     });
+
+    let expectedPrevHash = GENESIS_HASH;
+    let entriesChecked = 0;
 
     for await (const line of rl) {
       if (!line.trim()) continue;
@@ -130,20 +136,54 @@ export class HistoryManager {
           this.metadata = { ...this.metadata, ...record.data };
         } else if (record.type === 'entry') {
           const entry = record.data as HistoryEntry;
+          entriesChecked++;
+
+          // PoH Validation 1: Verify prevHash links to previous entry
+          if (entry.prevHash !== expectedPrevHash) {
+            this.chainValidation = {
+              valid: false,
+              entriesChecked,
+              error: `Chain broken at sequence ${entry.sequence}: prevHash mismatch`,
+              corruptedAtSequence: entry.sequence,
+            };
+            console.error(`[HistoryManager] PoH chain broken at sequence ${entry.sequence}`);
+            // Continue loading but mark as invalid
+          }
+
+          // PoH Validation 2: Verify entry hash is correct
+          const computedHash = computeEntryHash(entry);
+          if (computedHash !== entry.hash) {
+            this.chainValidation = {
+              valid: false,
+              entriesChecked,
+              error: `Invalid hash at sequence ${entry.sequence}: expected ${computedHash}, got ${entry.hash}`,
+              corruptedAtSequence: entry.sequence,
+            };
+            console.error(`[HistoryManager] Invalid hash at sequence ${entry.sequence}`);
+          }
+
+          // Update expected prevHash for next entry
+          expectedPrevHash = entry.hash;
+
+          // Update metadata from entry
           this.metadata.latestHash = entry.hash;
           this.metadata.entryCount = entry.sequence;
           this.metadata.lastUpdated = entry.date;
           if (entry.eventType === 'FEE') {
-             // Re-calculate total fees to be safe, or trust the sequence
-             // BigInt parsing needed
-             const amount = BigInt(entry.amount);
-             const currentTotal = BigInt(this.metadata.totalFees);
-             this.metadata.totalFees = (currentTotal + (amount > 0n ? amount : -amount)).toString();
+            const amount = BigInt(entry.amount);
+            const currentTotal = BigInt(this.metadata.totalFees);
+            this.metadata.totalFees = (currentTotal + (amount > 0n ? amount : -amount)).toString();
           }
         }
       } catch (e) {
-        // Ignore malformed lines
+        // Malformed line - log but don't break
+        console.warn(`[HistoryManager] Malformed line in history file: ${e}`);
       }
+    }
+
+    // Update validation result if no errors were found
+    if (this.chainValidation.valid) {
+      this.chainValidation.entriesChecked = entriesChecked;
     }
   }
 
@@ -201,6 +241,22 @@ export class HistoryManager {
 
   getMetadata(): HistoryMetadata {
     return { ...this.metadata };
+  }
+
+  /**
+   * Get the chain validation result from init().
+   * Returns { valid: true, entriesChecked: N } if chain is valid,
+   * or { valid: false, error: "...", corruptedAtSequence: N } if corrupted.
+   */
+  getChainValidation(): ChainValidationResult {
+    return { ...this.chainValidation };
+  }
+
+  /**
+   * Check if the history chain is valid (shorthand for getChainValidation().valid)
+   */
+  isChainValid(): boolean {
+    return this.chainValidation.valid;
   }
 
   close(): void {

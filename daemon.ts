@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import { RpcManager } from './lib/rpc-manager';
 import { TokenManager, deriveBondingCurveVault, derivePumpSwapVault, deriveAMMPool, deriveBondingCurve, DiscoveredToken } from './lib/token-manager';
 import { FeeTracker, FeeTrackerConfig } from './lib/fee-tracker';
-import { HistoryManager, HistoryEntry, HistoryLog, GENESIS_HASH, computeEntryHash } from './lib/history-manager';
+import { HistoryManager, HistoryEntry, HistoryLog, GENESIS_HASH, computeEntryHash, ChainValidationResult } from './lib/history-manager';
 import { WebSocketManager, WebSocketConfig, AccountUpdate, createVaultMonitor } from './lib/websocket-manager';
 import { RealtimeTracker, RealtimeTrackerConfig, BalanceSnapshot } from './lib/realtime-tracker';
 import {
@@ -23,6 +23,7 @@ import {
   validateHistoryLog,
   PUMP_PROGRAM_ID,
   PUMPSWAP_PROGRAM_ID,
+  TRUSTED_RPC_DOMAINS,
   LRUCache,
   RateLimiter,
   fetchWithRetry,
@@ -40,6 +41,7 @@ export {
   DiscoveredToken,
   HistoryEntry,
   HistoryLog,
+  ChainValidationResult,
   GENESIS_HASH,
   deriveBondingCurveVault,
   derivePumpSwapVault,
@@ -54,13 +56,16 @@ export {
   computeEntryHash,
   PUMP_PROGRAM_ID,
   PUMPSWAP_PROGRAM_ID,
+  TRUSTED_RPC_DOMAINS,
   LRUCache,
   RateLimiter,
   fetchWithRetry,
   CircuitBreaker,
   BondingCurveData,
   deserializeBondingCurve,
-  RetryConfig
+  RetryConfig,
+  RpcManager,
+  TokenManager,
 };
 
 // Re-export WebSocket modules

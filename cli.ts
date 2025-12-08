@@ -502,7 +502,9 @@ async function main(): Promise<void> {
     console.log(`Creator:    ${creator.toBase58()}`);
     console.log(`BC Vault:   ${bcVault.toBase58()}`);
     console.log(`AMM Vault:  ${ammVault.toBase58()}`);
-    console.log(`RPC:        ${args.rpcUrl.slice(0, 50)}...`);
+    // Mask API keys in RPC URL for security
+    const maskedRpcUrl = args.rpcUrl.replace(/([?&]api[_-]?key=)[^&]+/gi, '$1***').replace(/(https?:\/\/[^:]+:)[^@]+@/gi, '$1***@');
+    console.log(`RPC:        ${maskedRpcUrl.slice(0, 60)}...`);
     console.log(`Poll:       ${args.pollInterval / 1000}s`);
     if (args.historyFile) {
       console.log(`PoH:        ${args.historyFile} ✓`);

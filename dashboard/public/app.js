@@ -17,6 +17,7 @@ const bcBalanceEl = document.getElementById('bc-balance');
 const ammBalanceEl = document.getElementById('amm-balance');
 const feeCountEl = document.getElementById('fee-count');
 const feesTbody = document.getElementById('fees-tbody');
+const tokensTbody = document.getElementById('tokens-tbody');
 const lastUpdateEl = document.getElementById('last-update');
 
 // Chart setup
@@ -28,8 +29,8 @@ const chart = new Chart(ctx, {
     datasets: [{
       label: 'Cumulative Fees (SOL)',
       data: [],
-      borderColor: '#00d4aa',
-      backgroundColor: 'rgba(0, 212, 170, 0.1)',
+      borderColor: '#ff6b35',
+      backgroundColor: 'rgba(255, 107, 53, 0.1)',
       fill: true,
       tension: 0.4,
       pointRadius: 0,
@@ -95,6 +96,30 @@ function updateChart(fees) {
   chart.data.labels = chartData.map(d => formatShortTime(d.time));
   chart.data.datasets[0].data = chartData.map(d => d.fees);
   chart.update('none');
+}
+
+// Update tokens table
+function updateTokensTable(tokens) {
+  if (!tokens || tokens.length === 0) return;
+
+  tokensTbody.innerHTML = '';
+  tokens.forEach(token => {
+    const row = document.createElement('tr');
+    row.className = 'token-row';
+    const shortMint = token.mint.substring(0, 4) + '...' + token.mint.substring(token.mint.length - 4);
+    const status = token.migrated ? 'AMM' : 'BC';
+    const statusClass = token.migrated ? 'migrated' : 'active';
+    const displayName = token.name || token.symbol || '-';
+    row.innerHTML = `
+      <td class="token-symbol">${token.symbol}</td>
+      <td class="token-name">${displayName}</td>
+      <td class="token-mint" title="${token.mint}">${shortMint}</td>
+      <td class="token-fees">${token.totalFees} SOL</td>
+      <td class="token-count">${token.feeCount}</td>
+      <td class="token-status ${statusClass}">${status}</td>
+    `;
+    tokensTbody.appendChild(row);
+  });
 }
 
 // Add fee to table
@@ -164,6 +189,11 @@ function handleMessage(event) {
         state.recentFees.slice(0, 20).reverse().forEach(fee => addFeeToTable(fee));
       }
 
+      // Update tokens table
+      if (state.tokens) {
+        updateTokensTable(state.tokens);
+      }
+
       // Initialize chart
       updateChart(state.totalFees);
       break;
@@ -179,6 +209,11 @@ function handleMessage(event) {
       addFeeToTable(fee);
       updateChart(fee.totalFees);
       updateLastUpdate();
+
+      // Update tokens table
+      if (fee.tokens) {
+        updateTokensTable(fee.tokens);
+      }
 
       // Flash the total fees card
       const totalCard = document.querySelector('.stat-card.total-fees');

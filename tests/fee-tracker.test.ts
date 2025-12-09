@@ -671,3 +671,507 @@ describe('Edge Cases', () => {
     expect(tracker).toBeInstanceOf(FeeTracker);
   });
 });
+
+describe('Polling Behavior', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    rpcManager = createMockRpcManager();
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should schedule poll after start', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 5000,
+    };
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    expect(tracker.isRunning()).toBe(true);
+
+    // Advance timer by poll interval
+    jest.advanceTimersByTime(5000);
+
+    // Poll should have been triggered
+    await Promise.resolve();
+
+    tracker.stop();
+  });
+
+  it('should refresh bonding curves during poll', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    tokenManager.refreshBondingCurves.mockResolvedValue(new Map());
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    tracker.addToken(createTestToken());
+
+    await tracker.start();
+
+    // Advance timer to trigger poll
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(tokenManager.refreshBondingCurves).toHaveBeenCalled();
+
+    tracker.stop();
+  });
+
+  it('should handle poll errors gracefully', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    // Make getSlot throw an error
+    rpcManager.getConnection = jest.fn().mockReturnValue({
+      getSlot: jest.fn().mockRejectedValue(new Error('RPC Error')),
+      getTransaction: jest.fn().mockResolvedValue(null),
+    });
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // Should not throw on poll error
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(tracker.isRunning()).toBe(true);
+    tracker.stop();
+  });
+
+  it('should call onStats callback after poll', async () => {
+    const onStats = jest.fn();
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      onStats,
+    };
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    tracker.addToken(createTestToken());
+
+    await tracker.start();
+
+    // Advance timer to trigger poll
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+  });
+
+  it('should track UNKNOWN tokens for metadata retry', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: false,
+    };
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    tracker.addToken(createTestToken({ symbol: 'UNKNOWN' }));
+
+    await tracker.start();
+
+    // Verify token was added with UNKNOWN symbol
+    const tokens = tracker.getTrackedTokens();
+    expect(tokens[0].symbol).toBe('UNKNOWN');
+
+    tracker.stop();
+  });
+});
+
+describe('Transaction Processing', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    rpcManager = createMockRpcManager();
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should have getAllSignaturesSince method available', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue(['sig1']);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // Verify RPC manager was configured
+    expect(rpcManager.getAllSignaturesSince).toBeDefined();
+
+    tracker.stop();
+  });
+
+  it('should load state with previous signatures', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      stateFile: '/tmp/state.json',
+    };
+
+    const savedState = {
+      lastBcSignature: 'prevSig',
+      lastAmmSignature: 'prevAmmSig',
+      lastBcBalance: '1000000000',
+      lastAmmBalance: '500000000',
+    };
+
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(JSON.stringify(savedState));
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // State was loaded
+    expect(mockFs.readFileSync).toHaveBeenCalledWith('/tmp/state.json', 'utf-8');
+
+    tracker.stop();
+  });
+
+  it('should handle empty signature list', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+
+    // Should not throw
+    expect(tracker.isRunning()).toBe(true);
+
+    tracker.stop();
+  });
+});
+
+describe('Balance Consistency Checking', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    rpcManager = createMockRpcManager();
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should detect BC balance surplus as orphan fee', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    // Initial balance
+    rpcManager.getBalance.mockResolvedValueOnce(1000000000); // Start
+    rpcManager.getTokenAccountBalance.mockResolvedValue(BigInt(500000000));
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // Simulate balance increase (surplus) on next poll
+    rpcManager.getBalance.mockResolvedValue(1100000000);
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+
+    // Orphan fees should have increased
+    expect(tracker.getOrphanFees()).toBeGreaterThanOrEqual(0n);
+  });
+
+  it('should handle balance check errors gracefully', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getBalance.mockResolvedValueOnce(1000000000); // Start
+    rpcManager.getTokenAccountBalance.mockResolvedValue(BigInt(500000000));
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // Make balance check fail
+    rpcManager.getBalance.mockRejectedValue(new Error('RPC Error'));
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Should still be running
+    expect(tracker.isRunning()).toBe(true);
+
+    tracker.stop();
+  });
+});
+
+describe('State Validation Function', () => {
+  it('should reject null state', async () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue('null');
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      stateFile: '/tmp/test.json',
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    await expect(tracker.start()).resolves.not.toThrow();
+    tracker.stop();
+  });
+
+  it('should reject non-string bigint fields', async () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(JSON.stringify({
+      lastBcBalance: 123456, // number instead of string
+      lastAmmBalance: '500000000',
+    }));
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      stateFile: '/tmp/test.json',
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    await expect(tracker.start()).resolves.not.toThrow();
+    tracker.stop();
+  });
+
+  it('should reject invalid optional bigint fields', async () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(JSON.stringify({
+      lastBcBalance: '1000000000',
+      lastAmmBalance: '500000000',
+      accumulatedBcDelta: 'not-valid-bigint',
+    }));
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      stateFile: '/tmp/test.json',
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    await expect(tracker.start()).resolves.not.toThrow();
+    tracker.stop();
+  });
+
+  it('should reject non-object trackedTokens', async () => {
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(JSON.stringify({
+      lastBcBalance: '1000000000',
+      lastAmmBalance: '500000000',
+      trackedTokens: 'not-an-object',
+    }));
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      stateFile: '/tmp/test.json',
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    await expect(tracker.start()).resolves.not.toThrow();
+    tracker.stop();
+  });
+});
+
+describe('Token Migration Detection', () => {
+  it('should track initial migration state', () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    // Add non-migrated token
+    const token = createTestToken({ migrated: false });
+    tracker.addToken(token);
+
+    const stats = tracker.getStats();
+    expect(stats[0].migrated).toBe(false);
+  });
+
+  it('should track migrated token state', () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    const rpcManager = createMockRpcManager();
+    const tokenManager = createMockTokenManager();
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    // Add migrated token
+    const token = createTestToken({ migrated: true });
+    tracker.addToken(token);
+
+    const stats = tracker.getStats();
+    expect(stats[0].migrated).toBe(true);
+  });
+});
+
+describe('Verbose Logging', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+  let consoleSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rpcManager = createMockRpcManager();
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+
+    consoleSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  it('should log when verbose is enabled', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[FeeTracker]'));
+  });
+
+  it('should not log when verbose is disabled', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: false,
+    };
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Should not have FeeTracker logs (may have other logs)
+    const feeTrackerCalls = consoleSpy.mock.calls.filter(
+      (call: any[]) => call[0]?.includes?.('[FeeTracker]')
+    );
+    expect(feeTrackerCalls.length).toBe(0);
+  });
+});

@@ -1118,6 +1118,7 @@ describe('History Manager Integration', () => {
   let mockRpcManager: any;
   let mockHistoryManager: any;
   let bcUpdateCallback: ((update: any) => void) | null = null;
+  let ammUpdateCallback: ((update: any) => void) | null = null;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -1137,6 +1138,8 @@ describe('History Manager Integration', () => {
         const pubkeyStr = pubkey.toBase58();
         if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
           bcUpdateCallback = callback;
+        } else {
+          ammUpdateCallback = callback;
         }
         return Promise.resolve(1);
       }),
@@ -1216,6 +1219,649 @@ describe('History Manager Integration', () => {
       12346,
       1234567891
     );
+
+    await tracker.stop();
+  });
+
+  it('should record AMM fee in history manager', async () => {
+    const historyManager = new MockedHistoryManager('/tmp/test.json', 'c', 'b', 'a');
+    const tracker = new RealtimeTracker(config, historyManager);
+    await tracker.start();
+
+    // AMM balance increase
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: 1234567890,
+      });
+    }
+
+    expect(mockHistoryManager.addEntry).toHaveBeenCalledWith(
+      'FEE',
+      'AMM',
+      expect.any(String),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      12345,
+      1234567890,
+      undefined,
+      undefined
+    );
+
+    await tracker.stop();
+  });
+
+  it('should record AMM claim in history manager', async () => {
+    const historyManager = new MockedHistoryManager('/tmp/test.json', 'c', 'b', 'a');
+    const tracker = new RealtimeTracker(config, historyManager);
+    await tracker.start();
+
+    // AMM balance decrease
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(400000000n, 64);
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12346 },
+        timestamp: 1234567891,
+      });
+    }
+
+    expect(mockHistoryManager.addEntry).toHaveBeenCalledWith(
+      'CLAIM',
+      'AMM',
+      expect.any(String),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      12346,
+      1234567891
+    );
+
+    await tracker.stop();
+  });
+});
+
+describe('Fee Attribution', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let bcUpdateCallback: ((update: any) => void) | null = null;
+  let ammUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+      verbose: true,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
+          bcUpdateCallback = callback;
+        } else {
+          ammUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should attribute fee to tracked token by mint', async () => {
+    const tracker = new RealtimeTracker(config);
+    // Add a tracked token
+    tracker.addToken(createTestToken({ mint: 'TrackedMint123', symbol: 'TRACKED' }));
+    await tracker.start();
+
+    // Mock signatures found
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'sig123' }
+    ]);
+
+    // Mock transaction with token balances
+    mockRpcManager.getTransaction.mockResolvedValue({
+      meta: {
+        preTokenBalances: [{ mint: 'TrackedMint123' }],
+        postTokenBalances: [],
+      },
+    });
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    const stats = tracker.getStats();
+    const trackedStats = stats.find(s => s.mint === 'TrackedMint123');
+    expect(trackedStats).toBeDefined();
+    expect(trackedStats!.totalFees).toBeGreaterThan(0n);
+    expect(trackedStats!.feeCount).toBe(1);
+
+    await tracker.stop();
+  });
+
+  it('should return orphan when no signatures found', async () => {
+    const onFeeDetected = jest.fn();
+    const configWithCallback = { ...config, onFeeDetected };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // No signatures found
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([]);
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onFeeDetected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mint: 'orphan',
+        symbol: 'ORPHAN',
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should handle attribution error gracefully', async () => {
+    const onFeeDetected = jest.fn();
+    const configWithCallback = { ...config, onFeeDetected };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Make getSignaturesForAddress throw an error
+    mockRpcManager.getSignaturesForAddress.mockRejectedValue(new Error('RPC error'));
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    // Should still call callback with orphan
+    expect(onFeeDetected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mint: 'orphan',
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should skip WSOL mint during attribution', async () => {
+    const tracker = new RealtimeTracker(config);
+    await tracker.start();
+
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'sig123' }
+    ]);
+
+    // Transaction only has WSOL mint
+    mockRpcManager.getTransaction.mockResolvedValue({
+      meta: {
+        preTokenBalances: [{ mint: 'So11111111111111111111111111111111111111112' }],
+        postTokenBalances: [],
+      },
+    });
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    // Fee should be orphan since WSOL is skipped
+    expect(tracker.getTotalFees()).toBeGreaterThan(0n);
+
+    await tracker.stop();
+  });
+
+  it('should handle null transaction during attribution', async () => {
+    const tracker = new RealtimeTracker(config);
+    await tracker.start();
+
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'sig123' }
+    ]);
+    mockRpcManager.getTransaction.mockResolvedValue(null);
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(tracker.getTotalFees()).toBeGreaterThan(0n);
+
+    await tracker.stop();
+  });
+
+  it('should update AMM token stats on fee detection', async () => {
+    const tracker = new RealtimeTracker(config);
+    tracker.addToken(createTestToken({ mint: 'AmmMint456', symbol: 'AMMTOK' }));
+    await tracker.start();
+
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'ammSig123' }
+    ]);
+    mockRpcManager.getTransaction.mockResolvedValue({
+      meta: {
+        preTokenBalances: [{ mint: 'AmmMint456' }],
+        postTokenBalances: [],
+      },
+    });
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    const stats = tracker.getStats().find(s => s.mint === 'AmmMint456');
+    expect(stats).toBeDefined();
+    expect(stats!.totalFees).toBeGreaterThan(0n);
+
+    await tracker.stop();
+  });
+});
+
+describe('AMM Callback Errors', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let ammUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+      verbose: true,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr !== TEST_BC_VAULT.toBase58()) {
+          ammUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should handle onFeeDetected callback error in AMM update', async () => {
+    const onFeeDetected = jest.fn().mockImplementation(() => {
+      throw new Error('AMM callback error');
+    });
+    const configWithCallback = { ...config, onFeeDetected };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    // Should not throw
+    if (ammUpdateCallback) {
+      await expect(ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+
+  it('should handle onBalanceChange callback error in AMM update', async () => {
+    const onBalanceChange = jest.fn().mockImplementation(() => {
+      throw new Error('Balance change error');
+    });
+    const configWithCallback = { ...config, onBalanceChange };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    // Should not throw
+    if (ammUpdateCallback) {
+      await expect(ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+
+  it('should handle onStats callback error in AMM update', async () => {
+    const onStats = jest.fn().mockImplementation(() => {
+      throw new Error('Stats error');
+    });
+    const configWithCallback = { ...config, onStats };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    // Should not throw
+    if (ammUpdateCallback) {
+      await expect(ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+
+  it('should call onBalanceChange for AMM updates', async () => {
+    const onBalanceChange = jest.fn();
+    const configWithCallback = { ...config, onBalanceChange };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onBalanceChange).toHaveBeenCalledWith('AMM', 500000000n, 600000000n);
+
+    await tracker.stop();
+  });
+
+  it('should call onStats for AMM updates', async () => {
+    const onStats = jest.fn();
+    const configWithCallback = { ...config, onStats };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(600000000n, 64);
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onStats).toHaveBeenCalled();
+
+    await tracker.stop();
+  });
+});
+
+describe('BC Callback Errors', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let bcUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+      verbose: true,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
+          bcUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should handle onBalanceChange callback error in BC update', async () => {
+    const onBalanceChange = jest.fn().mockImplementation(() => {
+      throw new Error('BC balance change error');
+    });
+    const configWithCallback = { ...config, onBalanceChange };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Should not throw
+    if (bcUpdateCallback) {
+      await expect(bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+
+  it('should handle onStats callback error in BC update', async () => {
+    const onStats = jest.fn().mockImplementation(() => {
+      throw new Error('BC stats error');
+    });
+    const configWithCallback = { ...config, onStats };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Should not throw
+    if (bcUpdateCallback) {
+      await expect(bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+});
+
+describe('Token Stats LRU Update', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let bcUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
+          bcUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should refresh LRU order when updating token stats', async () => {
+    const tracker = new RealtimeTracker(config);
+
+    // Add tokens in order
+    tracker.addToken(createTestToken({ mint: 'First', bondingCurve: 'BC1' }));
+    tracker.addToken(createTestToken({ mint: 'Second', bondingCurve: 'BC2' }));
+    tracker.addToken(createTestToken({ mint: 'Third', bondingCurve: 'BC3' }));
+
+    await tracker.start();
+
+    // Mock attribution to return 'First' token
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'sig' }
+    ]);
+    mockRpcManager.getTransaction.mockResolvedValue({
+      meta: {
+        preTokenBalances: [{ mint: 'First' }],
+        postTokenBalances: [],
+      },
+    });
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    // 'First' should now be at the end (most recently accessed)
+    const stats = tracker.getStats();
+    expect(stats[stats.length - 1].mint).toBe('First');
+
+    await tracker.stop();
+  });
+
+  it('should not update stats for non-existent mint', async () => {
+    const tracker = new RealtimeTracker(config);
+    await tracker.start();
+
+    // No tokens added, so updateTokenStats should have no effect
+    mockRpcManager.getSignaturesForAddress.mockResolvedValue([
+      { slot: 12345, signature: 'sig' }
+    ]);
+    mockRpcManager.getTransaction.mockResolvedValue({
+      meta: {
+        preTokenBalances: [{ mint: 'NonExistentMint' }],
+        postTokenBalances: [],
+      },
+    });
+
+    // Fee will be orphan since token isn't tracked
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(tracker.getStats().length).toBe(0);
 
     await tracker.stop();
   });

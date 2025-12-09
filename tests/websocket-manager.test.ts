@@ -640,3 +640,417 @@ describe('Edge Cases', () => {
     expect(manager).toBeDefined();
   });
 });
+
+describe('Reconnection Logic', () => {
+  let mockConnection: any;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.clearAllMocks();
+    mockConnection = {
+      getSlot: jest.fn().mockResolvedValue(12345678),
+      onAccountChange: jest.fn().mockReturnValue(1),
+      onLogs: jest.fn().mockReturnValue(2),
+      removeAccountChangeListener: jest.fn().mockResolvedValue(undefined),
+      removeOnLogsListener: jest.fn().mockResolvedValue(undefined),
+    };
+    MockedConnection.mockImplementation(() => mockConnection);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should clear reconnect timer on disconnect', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 5000,
+      maxReconnectAttempts: 3,
+    });
+
+    // Start a reconnection process (this sets the reconnectTimer)
+    (manager as any).scheduleReconnect();
+
+    // State should be reconnecting
+    expect(manager.getState()).toBe('reconnecting');
+
+    // Disconnect while timer is pending - this should clear the timer
+    await manager.disconnect();
+
+    // Timer should be cleared and state should be disconnected
+    expect(manager.getState()).toBe('disconnected');
+    expect((manager as any).reconnectTimer).toBeNull();
+  });
+
+  it('should handle disconnect during reconnection timer', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 5000,
+      maxReconnectAttempts: 3,
+    });
+
+    await manager.connect();
+    await manager.subscribeToAccount(TEST_PUBKEY, jest.fn());
+
+    // Disconnect should clear any pending reconnect timers
+    await manager.disconnect();
+
+    expect(manager.getState()).toBe('disconnected');
+    expect(manager.getSubscriptionCount().accounts).toBe(0);
+  });
+
+  it('should emit reconnecting event with attempt count and delay', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 1000,
+      maxReconnectAttempts: 3,
+    });
+
+    const reconnectingHandler = jest.fn();
+    manager.on('reconnecting', reconnectingHandler);
+
+    // Access private method for testing
+    (manager as any).scheduleReconnect();
+
+    expect(reconnectingHandler).toHaveBeenCalledWith({
+      attempt: 1,
+      delayMs: 1000,
+    });
+  });
+
+  it('should use exponential backoff for reconnect delay', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 1000,
+      maxReconnectAttempts: 5,
+    });
+
+    const reconnectingHandler = jest.fn();
+    manager.on('reconnecting', reconnectingHandler);
+
+    // First attempt
+    (manager as any).scheduleReconnect();
+    expect(reconnectingHandler).toHaveBeenLastCalledWith({
+      attempt: 1,
+      delayMs: 1000,
+    });
+
+    // Reset and trigger second attempt
+    jest.advanceTimersByTime(1000);
+
+    // Second attempt after timer fires and fails to connect
+    mockConnection.getSlot.mockRejectedValueOnce(new Error('Connection failed'));
+    await Promise.resolve(); // Let async operations complete
+
+    (manager as any).reconnectAttempts = 1;
+    (manager as any).scheduleReconnect();
+    expect(reconnectingHandler).toHaveBeenLastCalledWith({
+      attempt: 2,
+      delayMs: 2000, // exponential: 1000 * 2^1
+    });
+  });
+
+  it('should emit maxReconnectAttemptsReached when max attempts exceeded', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 1000,
+      maxReconnectAttempts: 2,
+    });
+
+    const maxAttemptsHandler = jest.fn();
+    manager.on('maxReconnectAttemptsReached', maxAttemptsHandler);
+
+    // Simulate max attempts reached
+    (manager as any).reconnectAttempts = 2;
+    (manager as any).scheduleReconnect();
+
+    expect(maxAttemptsHandler).toHaveBeenCalled();
+    expect(manager.getState()).not.toBe('reconnecting');
+  });
+
+  it('should attempt reconnection and call connect', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 100,
+      maxReconnectAttempts: 3,
+    });
+
+    // Trigger scheduleReconnect without connecting first
+    (manager as any).scheduleReconnect();
+
+    // State should be reconnecting immediately
+    expect(manager.getState()).toBe('reconnecting');
+
+    // Advance timer to trigger reconnection attempt
+    jest.advanceTimersByTime(100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // After timer fires and connect succeeds, state should be connected
+    expect(manager.getState()).toBe('connected');
+  });
+
+  it('should resubscribe to accounts after successful reconnection', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 100,
+      maxReconnectAttempts: 3,
+    });
+
+    await manager.connect();
+
+    const callback = jest.fn();
+    await manager.subscribeToAccount(TEST_PUBKEY, callback);
+
+    // Simulate subscriptions exist and trigger resubscribeAll
+    const resubscribedHandler = jest.fn();
+    manager.on('resubscribed', resubscribedHandler);
+
+    // Manually trigger resubscribeAll
+    await (manager as any).resubscribeAll();
+
+    expect(resubscribedHandler).toHaveBeenCalledWith({
+      accounts: 1,
+      logs: 0,
+      totalAccounts: 1,
+      totalLogs: 0,
+    });
+
+    await manager.disconnect();
+  });
+
+  it('should resubscribe to logs after reconnection', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 100,
+      maxReconnectAttempts: 3,
+    });
+
+    await manager.connect();
+
+    const callback = jest.fn();
+    await manager.subscribeToLogs(TEST_PROGRAM_ID, callback);
+
+    const resubscribedHandler = jest.fn();
+    manager.on('resubscribed', resubscribedHandler);
+
+    // Manually trigger resubscribeAll
+    await (manager as any).resubscribeAll();
+
+    expect(resubscribedHandler).toHaveBeenCalledWith({
+      accounts: 0,
+      logs: 1,
+      totalAccounts: 0,
+      totalLogs: 1,
+    });
+
+    await manager.disconnect();
+  });
+
+  it('should emit resubscriptionError when account resubscription fails', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    await manager.connect();
+    await manager.subscribeToAccount(TEST_PUBKEY, jest.fn());
+
+    // Make onAccountChange throw
+    mockConnection.onAccountChange.mockImplementationOnce(() => {
+      throw new Error('Subscription failed');
+    });
+
+    const errorHandler = jest.fn();
+    manager.on('resubscriptionError', errorHandler);
+
+    await (manager as any).resubscribeAll();
+
+    expect(errorHandler).toHaveBeenCalledWith({
+      type: 'account',
+      key: TEST_PUBKEY.toBase58(),
+      error: expect.any(Error),
+    });
+
+    await manager.disconnect();
+  });
+
+  it('should emit resubscriptionError when log resubscription fails', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    await manager.connect();
+    await manager.subscribeToLogs(TEST_PROGRAM_ID, jest.fn());
+
+    // Make onLogs throw
+    mockConnection.onLogs.mockImplementationOnce(() => {
+      throw new Error('Logs subscription failed');
+    });
+
+    const errorHandler = jest.fn();
+    manager.on('resubscriptionError', errorHandler);
+
+    await (manager as any).resubscribeAll();
+
+    expect(errorHandler).toHaveBeenCalledWith({
+      type: 'logs',
+      key: `logs:${TEST_PROGRAM_ID.toBase58()}`,
+      error: expect.any(Error),
+    });
+
+    await manager.disconnect();
+  });
+
+  it('should not resubscribe if wsConnection is null', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    // Don't connect, wsConnection should be null
+    const resubscribedHandler = jest.fn();
+    manager.on('resubscribed', resubscribedHandler);
+
+    await (manager as any).resubscribeAll();
+
+    expect(resubscribedHandler).not.toHaveBeenCalled();
+  });
+
+  it('should restore callbacks after resubscription', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    await manager.connect();
+
+    const accountCallback = jest.fn();
+    const logCallback = jest.fn();
+
+    await manager.subscribeToAccount(TEST_PUBKEY, accountCallback);
+    await manager.subscribeToLogs(TEST_PROGRAM_ID, logCallback);
+
+    // Reset mock to track new subscriptions
+    mockConnection.onAccountChange.mockClear();
+    mockConnection.onLogs.mockClear();
+    mockConnection.onAccountChange.mockReturnValue(10);
+    mockConnection.onLogs.mockReturnValue(20);
+
+    await (manager as any).resubscribeAll();
+
+    // Verify new subscriptions were created
+    expect(mockConnection.onAccountChange).toHaveBeenCalled();
+    expect(mockConnection.onLogs).toHaveBeenCalled();
+
+    // Verify subscription count is correct after resubscription
+    expect(manager.getSubscriptionCount().accounts).toBe(1);
+    expect(manager.getSubscriptionCount().logs).toBe(1);
+
+    await manager.disconnect();
+  });
+
+  it('should invoke callback on account update after resubscription', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    await manager.connect();
+
+    const accountCallback = jest.fn();
+    await manager.subscribeToAccount(TEST_PUBKEY, accountCallback);
+
+    // Resubscribe
+    mockConnection.onAccountChange.mockClear();
+    mockConnection.onAccountChange.mockReturnValue(10);
+
+    await (manager as any).resubscribeAll();
+
+    // Simulate account update after resubscription
+    const onAccountChangeCall = mockConnection.onAccountChange.mock.calls[0];
+    const newCallback = onAccountChangeCall[1];
+
+    const mockAccountInfo = { lamports: 2000000000, data: Buffer.from([1, 2, 3]) } as any;
+    const mockContext = { slot: 99999999 };
+
+    newCallback(mockAccountInfo, mockContext);
+
+    expect(accountCallback).toHaveBeenCalledWith(expect.objectContaining({
+      pubkey: TEST_PUBKEY,
+      accountInfo: mockAccountInfo,
+      context: mockContext,
+    }));
+
+    await manager.disconnect();
+  });
+
+  it('should invoke callback on log update after resubscription', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+    });
+
+    await manager.connect();
+
+    const logCallback = jest.fn();
+    await manager.subscribeToLogs(TEST_PROGRAM_ID, logCallback);
+
+    // Resubscribe
+    mockConnection.onLogs.mockClear();
+    mockConnection.onLogs.mockReturnValue(20);
+
+    await (manager as any).resubscribeAll();
+
+    // Simulate log update after resubscription
+    const onLogsCall = mockConnection.onLogs.mock.calls[0];
+    const newCallback = onLogsCall[1];
+
+    const mockLogs = { signature: 'newSig123', logs: ['new log'], err: null };
+    const mockContext = { slot: 88888888 };
+
+    newCallback(mockLogs, mockContext);
+
+    expect(logCallback).toHaveBeenCalledWith(expect.objectContaining({
+      signature: 'newSig123',
+      logs: ['new log'],
+      err: null,
+      context: mockContext,
+    }));
+
+    await manager.disconnect();
+  });
+
+  it('should reschedule reconnection when connect fails during reconnection', async () => {
+    const manager = new WebSocketManager({
+      rpcUrl: TEST_RPC_URL,
+      reconnectDelayMs: 100,
+      maxReconnectAttempts: 5,
+    });
+
+    const reconnectingHandler = jest.fn();
+    manager.on('reconnecting', reconnectingHandler);
+
+    // First reconnection attempt - make connect fail
+    mockConnection.getSlot.mockRejectedValueOnce(new Error('Connection failed'));
+
+    // Start first reconnection
+    (manager as any).scheduleReconnect();
+    expect(reconnectingHandler).toHaveBeenCalledTimes(1);
+
+    // Advance timer to trigger first reconnection attempt
+    jest.advanceTimersByTime(100);
+
+    // Wait for async operations
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Connection failed, so it should have scheduled another reconnection
+    // The second reconnection should have been triggered
+    expect(reconnectingHandler).toHaveBeenCalledTimes(2);
+
+    // Second attempt should use exponential backoff (200ms)
+    expect(reconnectingHandler).toHaveBeenLastCalledWith({
+      attempt: 2,
+      delayMs: 200,
+    });
+
+    await manager.disconnect();
+  });
+});

@@ -696,3 +696,527 @@ describe('Edge Cases', () => {
     expect(() => new RealtimeTracker(emptyConfig)).not.toThrow();
   });
 });
+
+describe('Account Update Handling', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let bcUpdateCallback: ((update: any) => void) | null = null;
+  let ammUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+      verbose: false,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        // Capture callbacks based on pubkey
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
+          bcUpdateCallback = callback;
+        } else {
+          ammUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should capture BC and AMM subscription callbacks', async () => {
+    const tracker = new RealtimeTracker(config);
+    await tracker.start();
+
+    expect(bcUpdateCallback).not.toBeNull();
+    // AMM callback is set after deriving ATA
+    expect(mockWsManager.subscribeToAccount).toHaveBeenCalledTimes(2);
+
+    await tracker.stop();
+  });
+
+  it('should increment update count on BC update', async () => {
+    const tracker = new RealtimeTracker(config);
+    await tracker.start();
+
+    const initialCount = tracker.getUpdateCount();
+
+    // Simulate BC update
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1000000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(tracker.getUpdateCount()).toBe(initialCount + 1);
+
+    await tracker.stop();
+  });
+
+  it('should detect BC fee (balance increase)', async () => {
+    const onFeeDetected = jest.fn();
+    const configWithCallback = { ...config, onFeeDetected };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Simulate BC balance increase (fee received)
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 }, // Increased from initial 1000000000
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onFeeDetected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 100000000n,
+        slot: 12345,
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should emit feeDetected event on BC fee', async () => {
+    const tracker = new RealtimeTracker(config);
+    const feeHandler = jest.fn();
+    tracker.on('feeDetected', feeHandler);
+    await tracker.start();
+
+    // Simulate BC balance increase
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1200000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(feeHandler).toHaveBeenCalled();
+
+    await tracker.stop();
+  });
+
+  it('should emit claim event on BC withdrawal', async () => {
+    const tracker = new RealtimeTracker(config);
+    const claimHandler = jest.fn();
+    tracker.on('claim', claimHandler);
+    await tracker.start();
+
+    // Simulate BC balance decrease (withdrawal)
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 800000000 }, // Decreased from initial
+        context: { slot: 12346 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(claimHandler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        vault: 'BC',
+        amount: 200000000n,
+        slot: 12346,
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should call onBalanceChange callback', async () => {
+    const onBalanceChange = jest.fn();
+    const configWithCallback = { ...config, onBalanceChange };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onBalanceChange).toHaveBeenCalledWith('BC', 1000000000n, 1100000000n);
+
+    await tracker.stop();
+  });
+
+  it('should call onStats callback after update', async () => {
+    const onStats = jest.fn();
+    const configWithCallback = { ...config, onStats };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onStats).toHaveBeenCalled();
+
+    await tracker.stop();
+  });
+
+  it('should handle callback errors gracefully', async () => {
+    const onFeeDetected = jest.fn().mockImplementation(() => {
+      throw new Error('Callback error');
+    });
+    const configWithCallback = { ...config, onFeeDetected, verbose: true };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Should not throw
+    if (bcUpdateCallback) {
+      await expect(bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      })).resolves.not.toThrow();
+    }
+
+    await tracker.stop();
+  });
+});
+
+describe('AMM Update Handling', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let ammUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+      verbose: false,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr !== TEST_BC_VAULT.toBase58()) {
+          ammUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should handle invalid AMM account data', async () => {
+    const tracker = new RealtimeTracker({ ...config, verbose: true });
+    await tracker.start();
+
+    const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+
+    // Simulate AMM update with invalid data (too short)
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: Buffer.alloc(50) }, // Too short, needs 72 bytes
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    // Should log error
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid AMM account data')
+    );
+
+    consoleSpy.mockRestore();
+    await tracker.stop();
+  });
+
+  it('should handle AMM balance increase (fee)', async () => {
+    const onFeeDetected = jest.fn();
+    const configWithCallback = { ...config, onFeeDetected };
+    const tracker = new RealtimeTracker(configWithCallback);
+    await tracker.start();
+
+    // Create valid token account data
+    // Layout: mint (32) + owner (32) + amount (8) = 72 bytes minimum
+    const ammData = Buffer.alloc(72);
+    // Write amount at offset 64 (after mint 32 + owner 32)
+    ammData.writeBigUInt64LE(600000000n, 64); // Increased from initial 500000000
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(onFeeDetected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amount: 100000000n,
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should emit claim event on AMM withdrawal', async () => {
+    const tracker = new RealtimeTracker(config);
+    const claimHandler = jest.fn();
+    tracker.on('claim', claimHandler);
+    await tracker.start();
+
+    // AMM balance decrease
+    const ammData = Buffer.alloc(72);
+    ammData.writeBigUInt64LE(400000000n, 64); // Decreased from initial 500000000
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: ammData },
+        context: { slot: 12346 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(claimHandler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        vault: 'AMM',
+        amount: 100000000n,
+      })
+    );
+
+    await tracker.stop();
+  });
+
+  it('should handle non-Buffer AMM data', async () => {
+    const tracker = new RealtimeTracker({ ...config, verbose: true });
+    await tracker.start();
+
+    const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+
+    if (ammUpdateCallback) {
+      await ammUpdateCallback({
+        accountInfo: { data: 'not a buffer' },
+        context: { slot: 12345 },
+        timestamp: Date.now(),
+      });
+    }
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid AMM account data')
+    );
+
+    consoleSpy.mockRestore();
+    await tracker.stop();
+  });
+});
+
+describe('Token Stats LRU Eviction', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockResolvedValue(undefined),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+    MockedRpcManager.mockImplementation(() => ({
+      getBalance: jest.fn().mockResolvedValue(0),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(0n),
+    }) as any);
+    MockedTokenManager.mockImplementation(() => ({}) as any);
+  });
+
+  it('should enforce MAX_TOKEN_STATS limit', () => {
+    const tracker = new RealtimeTracker(config);
+
+    // Add 1000 tokens with different mints (to trigger stats limit)
+    for (let i = 0; i < 1000; i++) {
+      tracker.addToken(createTestToken({
+        bondingCurve: `BC${i}`,
+        mint: `MINT${i}`
+      }));
+    }
+
+    expect(tracker.getStats().length).toBe(1000);
+
+    // Add one more with new mint
+    tracker.addToken(createTestToken({
+      bondingCurve: 'NEWBC',
+      mint: 'NEWMINT'
+    }));
+
+    expect(tracker.getStats().length).toBe(1000);
+
+    // First mint should be evicted
+    const stats = tracker.getStats();
+    expect(stats.find(s => s.mint === 'MINT0')).toBeUndefined();
+    expect(stats.find(s => s.mint === 'NEWMINT')).toBeDefined();
+  });
+});
+
+describe('History Manager Integration', () => {
+  let config: RealtimeTrackerConfig;
+  let mockWsManager: any;
+  let mockRpcManager: any;
+  let mockHistoryManager: any;
+  let bcUpdateCallback: ((update: any) => void) | null = null;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    config = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      rpcUrl: TEST_RPC_URL,
+    };
+
+    mockWsManager = {
+      on: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      disconnect: jest.fn().mockResolvedValue(undefined),
+      subscribeToAccount: jest.fn().mockImplementation((pubkey: any, callback: any) => {
+        const pubkeyStr = pubkey.toBase58();
+        if (pubkeyStr === TEST_BC_VAULT.toBase58()) {
+          bcUpdateCallback = callback;
+        }
+        return Promise.resolve(1);
+      }),
+    };
+    MockedWebSocketManager.mockImplementation(() => mockWsManager);
+
+    mockRpcManager = {
+      getBalance: jest.fn().mockResolvedValue(1000000000),
+      getTokenAccountBalance: jest.fn().mockResolvedValue(BigInt(500000000)),
+      getSignaturesForAddress: jest.fn().mockResolvedValue([]),
+      getTransaction: jest.fn().mockResolvedValue(null),
+      getAccountInfo: jest.fn().mockResolvedValue(null),
+    };
+    MockedRpcManager.mockImplementation(() => mockRpcManager);
+
+    mockHistoryManager = {
+      addEntry: jest.fn(),
+    };
+    MockedHistoryManager.mockImplementation(() => mockHistoryManager);
+
+    MockedTokenManager.mockImplementation(() => ({
+      fetchMetadata: jest.fn().mockResolvedValue(null),
+    }) as any);
+  });
+
+  it('should record fee in history manager', async () => {
+    const historyManager = new MockedHistoryManager('/tmp/test.json', 'c', 'b', 'a');
+    const tracker = new RealtimeTracker(config, historyManager);
+    await tracker.start();
+
+    // Simulate BC fee
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 1100000000 },
+        context: { slot: 12345 },
+        timestamp: 1234567890,
+      });
+    }
+
+    expect(mockHistoryManager.addEntry).toHaveBeenCalledWith(
+      'FEE',
+      'BC',
+      expect.any(String),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      12345,
+      1234567890,
+      undefined,
+      undefined
+    );
+
+    await tracker.stop();
+  });
+
+  it('should record claim in history manager', async () => {
+    const historyManager = new MockedHistoryManager('/tmp/test.json', 'c', 'b', 'a');
+    const tracker = new RealtimeTracker(config, historyManager);
+    await tracker.start();
+
+    // Simulate BC withdrawal
+    if (bcUpdateCallback) {
+      await bcUpdateCallback({
+        accountInfo: { lamports: 800000000 },
+        context: { slot: 12346 },
+        timestamp: 1234567891,
+      });
+    }
+
+    expect(mockHistoryManager.addEntry).toHaveBeenCalledWith(
+      'CLAIM',
+      'BC',
+      expect.any(String),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      expect.any(BigInt),
+      12346,
+      1234567891
+    );
+
+    await tracker.stop();
+  });
+});

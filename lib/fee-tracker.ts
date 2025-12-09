@@ -11,9 +11,9 @@ import {
   WSOL_MINT,
   deserializeBondingCurve,
   getMemoryUsage,
-  fetchWithRetry
+  fetchWithRetry,
+  getAssociatedTokenAddress
 } from './utils';
-import { getAssociatedTokenAddress } from '@solana/spl-token';
 
 export interface FeeTrackerConfig {
   creator: PublicKey;

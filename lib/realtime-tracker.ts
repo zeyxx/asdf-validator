@@ -10,8 +10,8 @@ import {
   FeeRecord,
   WSOL_MINT,
   deserializeBondingCurve,
+  getAssociatedTokenAddress,
 } from './utils';
-import { getAssociatedTokenAddress } from '@solana/spl-token';
 
 export interface RealtimeTrackerConfig {
   creator: PublicKey;

@@ -19,6 +19,14 @@
   const FEE_RATE_WINDOW = 5 * 60 * 1000;
   const ALERT_THRESHOLD = 0.1;
 
+  // XSS Protection: Escape HTML special characters
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    var div = document.createElement('div');
+    div.textContent = String(str);
+    return div.innerHTML;
+  }
+
   // DOM elements (will be set after DOM is ready)
   let wsStatus, wsText, creatorAddress, totalFeesEl, bcBalanceEl, ammBalanceEl;
   let feeCountEl, orphanFeesEl, orphanCountEl, feesTbody, tokensTbody, lastUpdateEl;
@@ -188,39 +196,44 @@
     }
     tokensTbody.innerHTML = '';
     tokens.forEach(token => {
-      const row = document.createElement('tr');
+      var row = document.createElement('tr');
       row.className = 'token-row';
-      const shortMint = token.mint.substring(0, 4) + '...' + token.mint.substring(token.mint.length - 4);
-      const status = token.migrated ? 'AMM' : 'BC';
-      const statusClass = token.migrated ? 'migrated' : 'active';
-      const displayName = token.name || token.symbol || '-';
-      row.innerHTML = `
-        <td class="token-symbol">${token.symbol}</td>
-        <td class="token-name">${displayName}</td>
-        <td class="token-mint" title="${token.mint}">${shortMint}</td>
-        <td class="token-fees">${token.totalFees} SOL</td>
-        <td class="token-count">${token.feeCount}</td>
-        <td class="token-status ${statusClass}">${status}</td>
-      `;
+      var mint = escapeHtml(token.mint);
+      var shortMint = mint.substring(0, 4) + '...' + mint.substring(mint.length - 4);
+      var status = token.migrated ? 'AMM' : 'BC';
+      var statusClass = token.migrated ? 'migrated' : 'active';
+      var displayName = escapeHtml(token.name || token.symbol || '-');
+      var symbol = escapeHtml(token.symbol);
+      var totalFees = escapeHtml(token.totalFees);
+      var feeCount = escapeHtml(token.feeCount);
+      row.innerHTML = '<td class="token-symbol">' + symbol + '</td>' +
+        '<td class="token-name">' + displayName + '</td>' +
+        '<td class="token-mint" title="' + mint + '">' + shortMint + '</td>' +
+        '<td class="token-fees">' + totalFees + ' SOL</td>' +
+        '<td class="token-count">' + feeCount + '</td>' +
+        '<td class="token-status ' + statusClass + '">' + status + '</td>';
       tokensTbody.appendChild(row);
     });
   }
 
   // Add fee to table
   function addFeeToTable(fee) {
-    const emptyRow = feesTbody.querySelector('.empty-row');
+    var emptyRow = feesTbody.querySelector('.empty-row');
     if (emptyRow) emptyRow.remove();
 
-    const row = document.createElement('tr');
+    var row = document.createElement('tr');
     row.className = 'fee-row new';
-    row.innerHTML = `
-      <td>${formatTime(fee.timestamp)}</td>
-      <td class="amount">+${fee.amount} SOL</td>
-      <td class="vault ${fee.vault.toLowerCase()}">${fee.vault}</td>
-      <td class="slot">${fee.slot}</td>
-    `;
+    var amount = escapeHtml(fee.amount);
+    var vault = escapeHtml(fee.vault);
+    var vaultLower = vault.toLowerCase();
+    var slot = escapeHtml(fee.slot);
+    var time = escapeHtml(formatTime(fee.timestamp));
+    row.innerHTML = '<td>' + time + '</td>' +
+      '<td class="amount">+' + amount + ' SOL</td>' +
+      '<td class="vault ' + vaultLower + '">' + vault + '</td>' +
+      '<td class="slot">' + slot + '</td>';
     feesTbody.insertBefore(row, feesTbody.firstChild);
-    setTimeout(() => row.classList.remove('new'), 500);
+    setTimeout(function() { row.classList.remove('new'); }, 500);
     while (feesTbody.children.length > 20) {
       feesTbody.removeChild(feesTbody.lastChild);
     }
@@ -255,15 +268,22 @@
   function showAlert(message, type, duration) {
     type = type || 'info';
     duration = duration || 5000;
-    const alert = document.createElement('div');
-    alert.className = 'alert ' + type;
-    alert.innerHTML = '<span>' + message + '</span><button class="alert-close">&times;</button>';
-    alert.querySelector('.alert-close').addEventListener('click', function() {
-      alert.remove();
+    var alertEl = document.createElement('div');
+    alertEl.className = 'alert ' + type;
+    // Use textContent for the message span to prevent XSS
+    var span = document.createElement('span');
+    span.textContent = message;
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'alert-close';
+    closeBtn.innerHTML = '&times;';
+    closeBtn.addEventListener('click', function() {
+      alertEl.remove();
     });
-    alertsContainer.appendChild(alert);
+    alertEl.appendChild(span);
+    alertEl.appendChild(closeBtn);
+    alertsContainer.appendChild(alertEl);
     if (duration > 0) {
-      setTimeout(function() { alert.remove(); }, duration);
+      setTimeout(function() { alertEl.remove(); }, duration);
     }
   }
 
@@ -386,10 +406,21 @@
     }
   }
 
+  // Get auth token from URL query param
+  function getAuthToken() {
+    var params = new URLSearchParams(window.location.search);
+    return params.get('token') || '';
+  }
+
   // WebSocket connection
   function connect() {
     var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var ws = new WebSocket(protocol + '//' + window.location.host);
+    var token = getAuthToken();
+    var wsUrl = protocol + '//' + window.location.host;
+    if (token) {
+      wsUrl += '?token=' + encodeURIComponent(token);
+    }
+    var ws = new WebSocket(wsUrl);
 
     ws.onopen = function() {
       console.log('WebSocket connected');

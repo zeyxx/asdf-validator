@@ -79,6 +79,9 @@ export {
   BalanceSnapshot
 };
 
+// Re-export logger
+export { logger, createLogger, logFee, logBalanceChange, logConnection, logRequest } from './lib/logger';
+
 // Re-export HistoryEventType locally if needed or import
 export type HistoryEventType = 'FEE' | 'CLAIM';
 

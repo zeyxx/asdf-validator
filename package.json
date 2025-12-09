@@ -52,8 +52,8 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "@solana/spl-token": "^0.4.14",
     "express": "^5.2.1",
+    "winston": "^3.19.0",
     "ws": "^8.18.3"
   }
 }

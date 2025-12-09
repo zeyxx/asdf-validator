@@ -20,7 +20,10 @@ import {
   FeeRecord,
   TokenManager,
   RpcManager,
+  createLogger,
 } from '../daemon';
+
+const log = createLogger('dashboard');
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
@@ -77,6 +80,10 @@ if (args.length < 1) {
 const creatorAddress = args[0];
 const rpcUrl = args[1] || process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const port = parseInt(args[2] || '3000', 10);
+
+// Optional authentication token (set DASHBOARD_TOKEN env var to enable)
+const authToken = process.env.DASHBOARD_TOKEN || null;
+const authEnabled = !!authToken;
 
 // Validate creator address
 let creator: PublicKey;
@@ -204,6 +211,77 @@ const server = createServer(app);
 // WebSocket server
 const wss = new WebSocketServer({ server });
 const clients: Set<WebSocket> = new Set();
+const clientAliveMap: Map<WebSocket, boolean> = new Map();
+
+// Heartbeat interval (30 seconds)
+const HEARTBEAT_INTERVAL = 30000;
+
+// Rate Limiting Configuration
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 100; // 100 requests per minute per IP
+const rateLimitStore: Map<string, { count: number; resetTime: number }> = new Map();
+
+// Clean up old rate limit entries every minute
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of rateLimitStore) {
+    if (data.resetTime < now) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, RATE_LIMIT_WINDOW_MS);
+
+// Rate limiting middleware
+function rateLimiter(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  let data = rateLimitStore.get(ip);
+  if (!data || data.resetTime < now) {
+    data = { count: 0, resetTime: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitStore.set(ip, data);
+  }
+
+  data.count++;
+
+  // Set rate limit headers
+  res.set('X-RateLimit-Limit', String(RATE_LIMIT_MAX_REQUESTS));
+  res.set('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX_REQUESTS - data.count)));
+  res.set('X-RateLimit-Reset', String(Math.ceil(data.resetTime / 1000)));
+
+  if (data.count > RATE_LIMIT_MAX_REQUESTS) {
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: 'Rate limit exceeded. Please try again later.',
+      retryAfter: Math.ceil((data.resetTime - now) / 1000),
+    });
+    return;
+  }
+
+  next();
+}
+
+// Authentication middleware (only active if DASHBOARD_TOKEN is set)
+function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!authEnabled) {
+    return next();
+  }
+
+  // Check for token in header or query parameter
+  const token = req.headers['x-auth-token'] as string ||
+                req.headers['authorization']?.replace('Bearer ', '') ||
+                req.query.token as string;
+
+  if (!token || token !== authToken) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Valid authentication token required. Set X-Auth-Token header or ?token= query param.',
+    });
+    return;
+  }
+
+  next();
+}
 
 // Disable cache for development
 app.use((req, res, next) => {
@@ -213,8 +291,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve static files
+// Serve static files (no rate limiting for static files)
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false }));
+
+// Apply rate limiting and authentication to API routes
+app.use('/api', rateLimiter, authMiddleware);
+app.use('/health', rateLimiter); // Health endpoint doesn't require auth
 
 // API routes
 app.get('/api/state', (req, res) => {
@@ -388,18 +470,61 @@ function formatUptime(ms: number): string {
 }
 
 // WebSocket handling
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // Check authentication if enabled
+  if (authEnabled) {
+    const url = new URL(req.url || '', `http://${req.headers.host}`);
+    const token = url.searchParams.get('token');
+
+    if (!token || token !== authToken) {
+      ws.close(4001, 'Unauthorized');
+      log.warn('WebSocket connection rejected: Invalid token');
+      return;
+    }
+  }
+
   clients.add(ws);
-  console.log(`Client connected (${clients.size} total)`);
+  clientAliveMap.set(ws, true);
+  log.info('WebSocket client connected', { totalClients: clients.size });
 
   // Send current state
   ws.send(JSON.stringify({ type: 'state', data: state }));
 
+  // Handle pong response (client is alive)
+  ws.on('pong', () => {
+    clientAliveMap.set(ws, true);
+  });
+
   ws.on('close', () => {
     clients.delete(ws);
-    console.log(`Client disconnected (${clients.size} total)`);
+    clientAliveMap.delete(ws);
+    log.info('WebSocket client disconnected', { totalClients: clients.size });
+  });
+
+  ws.on('error', (error) => {
+    log.error('WebSocket client error', { error: error.message });
+    clients.delete(ws);
+    clientAliveMap.delete(ws);
   });
 });
+
+// Heartbeat: ping all clients every 30 seconds
+const heartbeatInterval = setInterval(() => {
+  for (const ws of clients) {
+    if (clientAliveMap.get(ws) === false) {
+      // Client didn't respond to previous ping, terminate
+      log.info('Terminating unresponsive WebSocket client');
+      clients.delete(ws);
+      clientAliveMap.delete(ws);
+      ws.terminate();
+      continue;
+    }
+
+    // Mark as not alive, will be set to true on pong
+    clientAliveMap.set(ws, false);
+    ws.ping();
+  }
+}, HEARTBEAT_INTERVAL);
 
 function broadcast(message: object) {
   const data = JSON.stringify(message);
@@ -512,6 +637,12 @@ tracker.on('error', (error) => {
 
 // Start server
 async function start() {
+  log.info('Starting ASDF Validator Dashboard', {
+    creator: creator.toBase58(),
+    bcVault: bcVault.toBase58(),
+    ammVault: ammVault.toBase58(),
+    authEnabled,
+  });
   console.log('');
   console.log('='.repeat(60));
   console.log('   ASDF Validator Dashboard');
@@ -520,6 +651,7 @@ async function start() {
   console.log(`Creator:   ${creator.toBase58()}`);
   console.log(`BC Vault:  ${bcVault.toBase58()}`);
   console.log(`AMM Vault: ${ammVault.toBase58()}`);
+  console.log(`Auth:      ${authEnabled ? 'ENABLED (set DASHBOARD_TOKEN)' : 'DISABLED'}`);
   console.log('');
 
   // Discover tokens created by this creator
@@ -583,7 +715,18 @@ async function start() {
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
+  log.info('Shutting down dashboard...');
   console.log('\nShutting down...');
+  clearInterval(heartbeatInterval);
+  clearInterval(rateLimitCleanupInterval);
+
+  // Close all WebSocket connections
+  for (const ws of clients) {
+    ws.close(1000, 'Server shutting down');
+  }
+  clients.clear();
+  clientAliveMap.clear();
+
   await tracker.stop();
   server.close();
   process.exit(0);

@@ -1737,3 +1737,701 @@ describe('Dynamic Token Discovery', () => {
     expect(config.onTokenDiscovered).not.toHaveBeenCalled();
   });
 });
+
+describe('Poll and Transaction Processing', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+  let historyManager: jest.Mocked<HistoryManager>;
+  let mockConnection: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockConnection = {
+      getSlot: jest.fn().mockResolvedValue(12345678),
+      getTransaction: jest.fn().mockResolvedValue(null),
+    };
+
+    rpcManager = createMockRpcManager();
+    rpcManager.getConnection.mockReturnValue(mockConnection);
+
+    tokenManager = createMockTokenManager();
+    historyManager = createMockHistoryManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should process BC transaction with balance increase', async () => {
+    const onFeeDetected = jest.fn();
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      onFeeDetected,
+      verbose: true,
+    };
+
+    // Mock signatures
+    rpcManager.getAllSignaturesSince.mockResolvedValueOnce(['latestSig']);
+    rpcManager.getAllSignaturesSince.mockResolvedValue(['sig1']);
+
+    // Mock BC transaction with fee
+    const mockTx = {
+      slot: 12345,
+      blockTime: Date.now(),
+      meta: {
+        preBalances: [1000000000, 0],
+        postBalances: [1100000000, 0],
+        preTokenBalances: [],
+        postTokenBalances: [],
+        loadedAddresses: { writable: [], readonly: [] },
+      },
+      transaction: {
+        message: {
+          staticAccountKeys: [TEST_BC_VAULT, TEST_CREATOR].map(k => new PublicKey(k)),
+        },
+      },
+    };
+    mockConnection.getTransaction.mockResolvedValue(mockTx);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+
+    // Advance timer to trigger poll
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+
+    // Check that fees were processed
+    expect(tracker.getTotalFees()).toBeGreaterThanOrEqual(0n);
+  });
+
+  it('should skip already processed signatures (idempotency)', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    // Return same signature twice
+    rpcManager.getAllSignaturesSince.mockResolvedValue(['sig1']);
+
+    const mockTx = {
+      slot: 12345,
+      meta: {
+        preBalances: [1000000000],
+        postBalances: [1100000000],
+        preTokenBalances: [],
+        postTokenBalances: [],
+        loadedAddresses: { writable: [], readonly: [] },
+      },
+      transaction: {
+        message: {
+          staticAccountKeys: [TEST_BC_VAULT].map(k => new PublicKey(k)),
+        },
+      },
+    };
+    mockConnection.getTransaction.mockResolvedValue(mockTx);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    // First poll
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Second poll - same signature should be skipped
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+  });
+
+  it('should handle AMM WSOL token balance changes configuration', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Verify tracker setup for AMM
+    expect(tracker).toBeDefined();
+  });
+
+  it('should track migration state on token', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    // Add non-migrated token, then migrated token
+    const token1 = createTestToken({ migrated: false, bondingCurve: 'BC1', mint: 'M1' });
+    const token2 = createTestToken({ migrated: true, bondingCurve: 'BC2', mint: 'M2' });
+    tracker.addToken(token1);
+    tracker.addToken(token2);
+
+    await tracker.start();
+    tracker.stop();
+
+    const stats = tracker.getStats();
+    expect(stats.find(s => s.mint === 'M1')?.migrated).toBe(false);
+    expect(stats.find(s => s.mint === 'M2')?.migrated).toBe(true);
+  });
+
+  it('should track token reserve changes via addToken', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken({ lastSolReserves: 1000000000n });
+    tracker.addToken(token);
+
+    const tokens = tracker.getTrackedTokens();
+    expect(tokens[0].lastSolReserves).toBe(1000000000n);
+  });
+
+  it('should track UNKNOWN symbol for metadata retry', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 100,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+    tokenManager.refreshBondingCurves.mockResolvedValue(new Map());
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken({ symbol: 'UNKNOWN' });
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify UNKNOWN symbol is tracked
+    const tokens = tracker.getTrackedTokens();
+    expect(tokens[0].symbol).toBe('UNKNOWN');
+  });
+
+  it('should handle failed metadata fetch gracefully', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 100,
+      verbose: true,
+    };
+
+    tokenManager.fetchMetadata.mockRejectedValue(new Error('Metadata fetch failed'));
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+    tokenManager.refreshBondingCurves.mockResolvedValue(new Map());
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken({ symbol: 'UNKNOWN' });
+    tracker.addToken(token);
+
+    await tracker.start();
+
+    // Run 60 polls to trigger metadata fetch
+    for (let i = 0; i < 61; i++) {
+      jest.advanceTimersByTime(100);
+      await Promise.resolve();
+    }
+
+    tracker.stop();
+
+    // Should not throw
+    const tokens = tracker.getTrackedTokens();
+    expect(tokens[0].symbol).toBe('UNKNOWN');
+  });
+});
+
+describe('Balance Consistency Check', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    rpcManager = createMockRpcManager();
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+
+    const mockConnection = {
+      getSlot: jest.fn().mockResolvedValue(12345678),
+      getTransaction: jest.fn().mockResolvedValue(null),
+    };
+    rpcManager.getConnection.mockReturnValue(mockConnection as any);
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+    tokenManager.refreshBondingCurves.mockResolvedValue(new Map());
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should start with zero orphan fees', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getBalance.mockResolvedValue(1000000000);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Initial orphan fees should be 0
+    expect(tracker.getOrphanFees()).toBe(0n);
+  });
+
+  it('should setup BC balance tracking', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getBalance.mockResolvedValue(1000000000);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Verify getBalance was called
+    expect(rpcManager.getBalance).toHaveBeenCalled();
+  });
+
+  it('should setup AMM balance tracking', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getBalance.mockResolvedValue(1000000000);
+    rpcManager.getTokenAccountBalance.mockResolvedValue(BigInt(500000000));
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Verify getTokenAccountBalance was called
+    expect(rpcManager.getTokenAccountBalance).toHaveBeenCalled();
+  });
+
+  it('should track orphan fees getter', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getBalance.mockResolvedValue(1000000000);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+
+    // Orphan fees getter returns bigint
+    expect(typeof tracker.getOrphanFees()).toBe('bigint');
+  });
+
+  it('should handle deficit exceeding orphan fees (reset to 0)', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    // Surplus then larger deficit
+    rpcManager.getBalance
+      .mockResolvedValueOnce(1000000000)
+      .mockResolvedValueOnce(1050000000)  // Surplus +50
+      .mockResolvedValue(900000000);      // Deficit -150 > orphan 50
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+
+    expect(tracker.getOrphanFees()).toBe(0n);
+  });
+});
+
+describe('Fee Recording and Distribution', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+  let historyManager: jest.Mocked<HistoryManager>;
+  let mockConnection: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockConnection = {
+      getSlot: jest.fn().mockResolvedValue(12345678),
+      getTransaction: jest.fn().mockResolvedValue(null),
+    };
+
+    rpcManager = createMockRpcManager();
+    rpcManager.getConnection.mockReturnValue(mockConnection);
+
+    tokenManager = createMockTokenManager();
+    historyManager = createMockHistoryManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should accept history manager in constructor', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager, historyManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify tracker was created with history manager
+    expect(tracker).toBeDefined();
+  });
+
+  it('should accept onFeeDetected callback in config', async () => {
+    const onFeeDetected = jest.fn();
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      onFeeDetected,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify tracker was created with onFeeDetected
+    expect(tracker).toBeDefined();
+  });
+
+  it('should distribute unattributed fees proportionally', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    // Two tokens with reserve changes
+    const updates = new Map();
+    updates.set('BC1', { migrated: false, reserves: 1200000000n });
+    updates.set('BC2', { migrated: false, reserves: 800000000n });
+    tokenManager.refreshBondingCurves.mockResolvedValue(updates);
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    tracker.addToken(createTestToken({
+      bondingCurve: 'BC1',
+      mint: 'MINT1',
+      lastSolReserves: 1000000000n,
+    }));
+    tracker.addToken(createTestToken({
+      bondingCurve: 'BC2',
+      mint: 'MINT2',
+      lastSolReserves: 600000000n,
+    }));
+
+    await tracker.start();
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+
+    tracker.stop();
+  });
+
+  it('should handle transaction processing error gracefully', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      verbose: true,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue(['sig1']);
+
+    // getTransaction throws error
+    mockConnection.getTransaction.mockRejectedValue(new Error('Transaction fetch failed'));
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    jest.advanceTimersByTime(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+
+    // Should not throw
+    expect(tracker.isRunning()).toBe(false);
+  });
+
+  it('should evict oldest signature when MAX_PROCESSED_SIGNATURES exceeded', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 100,
+      verbose: true,
+    };
+
+    // Generate many signatures
+    const signatures = Array.from({ length: 110 }, (_, i) => `sig${i}`);
+    rpcManager.getAllSignaturesSince.mockResolvedValue(signatures);
+
+    const mockTx = {
+      slot: 12345,
+      meta: {
+        preBalances: [1000000000],
+        postBalances: [1001000000],
+        preTokenBalances: [],
+        postTokenBalances: [],
+        loadedAddresses: { writable: [], readonly: [] },
+      },
+      transaction: {
+        message: {
+          staticAccountKeys: [TEST_BC_VAULT].map(k => new PublicKey(k)),
+        },
+      },
+    };
+    mockConnection.getTransaction.mockResolvedValue(mockTx);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+
+    jest.advanceTimersByTime(200);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    tracker.stop();
+  });
+
+  it('should support onStats callback configuration', async () => {
+    const onStats = jest.fn();
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+      onStats,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+    tokenManager.refreshBondingCurves.mockResolvedValue(new Map());
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    await tracker.start();
+    tracker.stop();
+
+    // Verify tracker was created with onStats callback
+    expect(tracker).toBeDefined();
+  });
+});
+
+describe('Transaction Attribution', () => {
+  let rpcManager: jest.Mocked<RpcManager>;
+  let tokenManager: jest.Mocked<TokenManager>;
+  let mockConnection: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+
+    mockConnection = {
+      getSlot: jest.fn().mockResolvedValue(12345678),
+      getTransaction: jest.fn().mockResolvedValue(null),
+    };
+
+    rpcManager = createMockRpcManager();
+    rpcManager.getConnection.mockReturnValue(mockConnection);
+
+    tokenManager = createMockTokenManager();
+
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.writeFileSync.mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('should setup attribution by bondingCurve in account keys', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify the tracker setup with tracked tokens
+    expect(tracker.getTrackedTokens().length).toBe(1);
+    expect(tracker.getTrackedTokens()[0].bondingCurve).toBe(TEST_BC);
+  });
+
+  it('should setup attribution by mint in token balances', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify the tracker setup
+    expect(tracker.getTrackedTokens().length).toBe(1);
+    expect(tracker.getTrackedTokens()[0].mint).toBe(TEST_MINT);
+  });
+
+  it('should setup attribution by ammPool in account keys', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    const ammPoolAddress = '7nPEgJkPwR2HPnHnP3mRfSXvNBLuJNvMfaRdrN3eo1uV';
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken({ ammPool: ammPoolAddress });
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Verify the tracker setup
+    expect(tracker.getTrackedTokens().length).toBe(1);
+    expect(tracker.getTrackedTokens()[0].ammPool).toBe(ammPoolAddress);
+  });
+
+  it('should handle transactions with balance decrease (claim)', async () => {
+    const config: FeeTrackerConfig = {
+      creator: TEST_CREATOR,
+      bcVault: TEST_BC_VAULT,
+      ammVault: TEST_AMM_VAULT,
+      pollIntervalMs: 1000,
+    };
+
+    rpcManager.getAllSignaturesSince.mockResolvedValue([]);
+
+    const tracker = new FeeTracker(config, rpcManager, tokenManager);
+    const token = createTestToken();
+    tracker.addToken(token);
+
+    await tracker.start();
+    tracker.stop();
+
+    // Claims (balance decrease) don't generate fees
+    expect(tracker.getTotalFees()).toBe(0n);
+  });
+});

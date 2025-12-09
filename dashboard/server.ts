@@ -205,8 +205,16 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server });
 const clients: Set<WebSocket> = new Set();
 
+// Disable cache for development
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
 // Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false }));
 
 // API routes
 app.get('/api/state', (req, res) => {
@@ -234,7 +242,11 @@ app.get('/health', async (req, res) => {
     : { state: 'UNKNOWN', canExecute: false };
 
   // Get RPC health (async)
-  let rpcHealth = { healthy: false, latencyMs: 0, error: 'Not initialized' };
+  let rpcHealth: { healthy: boolean; latencyMs?: number; error?: string } = {
+    healthy: false,
+    latencyMs: 0,
+    error: 'Not initialized'
+  };
   if (rpcManager) {
     try {
       rpcHealth = await rpcManager.checkHealth(5000);

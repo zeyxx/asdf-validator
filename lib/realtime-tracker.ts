@@ -231,25 +231,36 @@ export class RealtimeTracker extends EventEmitter {
 
   /**
    * Attribute a fee to a specific token by fetching and parsing the transaction
+   * Improved: higher signature limit, wider slot tolerance, retry mechanism
    */
   private async attributeFee(
     vaultType: 'BC' | 'AMM',
     slot: number,
-    amount: bigint
+    amount: bigint,
+    retryCount: number = 0
   ): Promise<{ mint: string; symbol: string }> {
+    const MAX_RETRIES = 2;
+    const SIGNATURE_LIMIT = 20; // Increased from 5
+    const SLOT_TOLERANCE = 5;   // Increased from 2
+
     try {
       const vault = vaultType === 'BC' ? this.config.bcVault : this.ammVaultATA!;
 
       // Fetch recent signatures for the vault
-      const signatures = await this.rpcManager.getSignaturesForAddress(vault, { limit: 5 });
+      const signatures = await this.rpcManager.getSignaturesForAddress(vault, { limit: SIGNATURE_LIMIT });
 
       if (signatures.length === 0) {
+        // Retry after delay if no signatures found
+        if (retryCount < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, 500));
+          return this.attributeFee(vaultType, slot, amount, retryCount + 1);
+        }
         return { mint: 'orphan', symbol: 'ORPHAN' };
       }
 
-      // Find transaction at or near this slot
+      // Find transaction at or near this slot (wider tolerance)
       for (const sig of signatures) {
-        if (Math.abs(sig.slot - slot) <= 2) {
+        if (Math.abs(sig.slot - slot) <= SLOT_TOLERANCE) {
           const tx = await this.rpcManager.getTransaction(sig.signature);
           if (!tx) continue;
 
@@ -276,8 +287,19 @@ export class RealtimeTracker extends EventEmitter {
           }
         }
       }
+
+      // No match found - retry after delay
+      if (retryCount < MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 300));
+        return this.attributeFee(vaultType, slot, amount, retryCount + 1);
+      }
     } catch (error) {
       this.log(`Attribution error: ${error}`);
+      // Retry on error
+      if (retryCount < MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 500));
+        return this.attributeFee(vaultType, slot, amount, retryCount + 1);
+      }
     }
 
     return { mint: 'orphan', symbol: 'ORPHAN' };

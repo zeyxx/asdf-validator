@@ -206,5 +206,212 @@ describe('ValidatorSDK', () => {
 
       expect(result).toHaveLength(0);
     });
+
+    it('should return ranked contributions sorted by amount', async () => {
+      const mints = [
+        new PublicKey('So11111111111111111111111111111111111111112'),
+        new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
+      ];
+
+      // Layout: discriminator(8) + mint(32) + bonding_curve(32) +
+      //         last_validated_slot(8) + total_validated_lamports(8) +
+      //         total_validated_count(8) + fee_rate_bps(2) + bump(1)
+      const mockData1 = Buffer.alloc(100);
+      mints[0].toBuffer().copy(mockData1, 8); // mint at 8
+      mockData1.writeBigUInt64LE(12345n, 72); // lastValidatedSlot at 72
+      mockData1.writeBigUInt64LE(100n, 80); // totalValidatedLamports at 80
+      mockData1.writeBigUInt64LE(1n, 88); // totalValidatedCount at 88
+      mockData1.writeUInt16LE(100, 96); // feeRateBps at 96
+
+      const mockData2 = Buffer.alloc(100);
+      mints[1].toBuffer().copy(mockData2, 8);
+      mockData2.writeBigUInt64LE(12346n, 72);
+      mockData2.writeBigUInt64LE(300n, 80);
+      mockData2.writeBigUInt64LE(3n, 88);
+      mockData2.writeUInt16LE(100, 96);
+
+      (mockConnection.getMultipleAccountsInfo as jest.Mock).mockResolvedValue([
+        { data: mockData1 },
+        { data: mockData2 },
+      ]);
+
+      const result = await sdk.getLeaderboard(mints);
+
+      expect(result).toHaveLength(2);
+      // Should be sorted by totalLamports descending
+      expect(result[0].rank).toBe(1);
+      expect(result[1].rank).toBe(2);
+    });
+
+    it('should calculate percentages correctly', async () => {
+      const mints = [new PublicKey('So11111111111111111111111111111111111111112')];
+
+      const mockData = Buffer.alloc(100);
+      mints[0].toBuffer().copy(mockData, 8);
+      mockData.writeBigUInt64LE(12345n, 72);
+      mockData.writeBigUInt64LE(1000n, 80);
+      mockData.writeBigUInt64LE(10n, 88);
+      mockData.writeUInt16LE(100, 96);
+
+      (mockConnection.getMultipleAccountsInfo as jest.Mock).mockResolvedValue([
+        { data: mockData },
+      ]);
+
+      const result = await sdk.getLeaderboard(mints);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].percentage).toBe(100); // Single contributor = 100%
+    });
+  });
+
+  describe('getValidatorState', () => {
+    it('should return null when account does not exist', async () => {
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+      (mockConnection.getAccountInfo as jest.Mock).mockResolvedValue(null);
+
+      const result = await sdk.getValidatorState(mint);
+
+      expect(result).toBeNull();
+    });
+
+    it('should parse and return validator state when account exists', async () => {
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+
+      // Layout: discriminator(8) + mint(32) + bonding_curve(32) +
+      //         last_validated_slot(8) + total_validated_lamports(8) +
+      //         total_validated_count(8) + fee_rate_bps(2) + bump(1)
+      const mockData = Buffer.alloc(100);
+      mint.toBuffer().copy(mockData, 8); // mint at 8
+      mockData.writeBigUInt64LE(12345678n, 72); // lastValidatedSlot at 72
+      mockData.writeBigUInt64LE(1000000000n, 80); // totalValidatedLamports at 80
+      mockData.writeBigUInt64LE(5n, 88); // totalValidatedCount at 88
+      mockData.writeUInt16LE(100, 96); // feeRateBps at 96
+      mockData[98] = 255; // bump at 98
+
+      (mockConnection.getAccountInfo as jest.Mock).mockResolvedValue({ data: mockData });
+
+      const result = await sdk.getValidatorState(mint);
+
+      expect(result).not.toBeNull();
+      expect(result?.totalValidatedLamports).toBe(1000000000n);
+      expect(result?.totalValidatedCount).toBe(5);
+      expect(result?.feeRateBps).toBe(100);
+    });
+  });
+
+  describe('getContribution', () => {
+    it('should return null when validator state does not exist', async () => {
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+      (mockConnection.getAccountInfo as jest.Mock).mockResolvedValue(null);
+
+      const result = await sdk.getContribution(mint);
+
+      expect(result).toBeNull();
+    });
+
+    it('should return contribution data when state exists', async () => {
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+
+      const mockData = Buffer.alloc(100);
+      mint.toBuffer().copy(mockData, 8);
+      mockData.writeBigUInt64LE(12345678n, 72); // lastValidatedSlot
+      mockData.writeBigUInt64LE(2000000000n, 80); // totalValidatedLamports (2 SOL)
+      mockData.writeBigUInt64LE(10n, 88); // totalValidatedCount
+      mockData.writeUInt16LE(150, 96); // feeRateBps
+
+      (mockConnection.getAccountInfo as jest.Mock).mockResolvedValue({ data: mockData });
+
+      const result = await sdk.getContribution(mint);
+
+      expect(result).not.toBeNull();
+      expect(result?.mint).toBe(mint.toBase58());
+      expect(result?.totalLamports).toBe(2000000000n);
+      expect(result?.totalSOL).toBe(2);
+      expect(result?.validationCount).toBe(10);
+      expect(result?.feeRateBps).toBe(150);
+    });
+  });
+
+  describe('getContributions with actual data', () => {
+    it('should return contributions for accounts that exist', async () => {
+      const mint1 = new PublicKey('So11111111111111111111111111111111111111112');
+      const mint2 = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+
+      const mockData1 = Buffer.alloc(100);
+      mint1.toBuffer().copy(mockData1, 8);
+      mockData1.writeBigUInt64LE(12345n, 72);
+      mockData1.writeBigUInt64LE(1000000000n, 80);
+      mockData1.writeBigUInt64LE(5n, 88);
+      mockData1.writeUInt16LE(100, 96);
+
+      const mockData2 = Buffer.alloc(100);
+      mint2.toBuffer().copy(mockData2, 8);
+      mockData2.writeBigUInt64LE(12346n, 72);
+      mockData2.writeBigUInt64LE(2000000000n, 80);
+      mockData2.writeBigUInt64LE(10n, 88);
+      mockData2.writeUInt16LE(200, 96);
+
+      (mockConnection.getMultipleAccountsInfo as jest.Mock).mockResolvedValue([
+        { data: mockData1 },
+        { data: mockData2 },
+      ]);
+
+      const result = await sdk.getContributions([mint1, mint2]);
+
+      expect(result.size).toBe(2);
+      expect(result.get(mint1.toBase58())?.totalSOL).toBe(1);
+      expect(result.get(mint2.toBase58())?.totalSOL).toBe(2);
+    });
+
+    it('should skip accounts that do not exist', async () => {
+      const mint1 = new PublicKey('So11111111111111111111111111111111111111112');
+      const mint2 = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+
+      const mockData1 = Buffer.alloc(100);
+      mint1.toBuffer().copy(mockData1, 8);
+      mockData1.writeBigUInt64LE(12345n, 72);
+      mockData1.writeBigUInt64LE(1000000000n, 80);
+      mockData1.writeBigUInt64LE(5n, 88);
+      mockData1.writeUInt16LE(100, 96);
+
+      (mockConnection.getMultipleAccountsInfo as jest.Mock).mockResolvedValue([
+        { data: mockData1 },
+        null, // Second account doesn't exist
+      ]);
+
+      const result = await sdk.getContributions([mint1, mint2]);
+
+      expect(result.size).toBe(1);
+      expect(result.has(mint1.toBase58())).toBe(true);
+      expect(result.has(mint2.toBase58())).toBe(false);
+    });
+  });
+
+  describe('parseValidatorState', () => {
+    it('should parse buffer into ValidatorState', () => {
+      const mint = new PublicKey('So11111111111111111111111111111111111111112');
+      const bc = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+
+      // Layout: discriminator(8) + mint(32) + bonding_curve(32) +
+      //         last_validated_slot(8) + total_validated_lamports(8) +
+      //         total_validated_count(8) + fee_rate_bps(2) + bump(1)
+      const mockData = Buffer.alloc(100);
+      mint.toBuffer().copy(mockData, 8); // mint at offset 8
+      bc.toBuffer().copy(mockData, 40); // bondingCurve at offset 40
+      mockData.writeBigUInt64LE(99999n, 72); // lastValidatedSlot at 72
+      mockData.writeBigUInt64LE(5000000000n, 80); // totalValidatedLamports at 80
+      mockData.writeBigUInt64LE(25n, 88); // totalValidatedCount at 88
+      mockData.writeUInt16LE(250, 96); // feeRateBps at 96
+      mockData[98] = 254; // bump at 98
+
+      // Access internal method via bracket notation
+      const state = (sdk as any).parseValidatorState(mockData);
+
+      expect(state.totalValidatedLamports).toBe(5000000000n);
+      expect(state.totalValidatedCount).toBe(25);
+      expect(state.lastValidatedSlot).toBe(99999);
+      expect(state.feeRateBps).toBe(250);
+      expect(state.bump).toBe(254);
+    });
   });
 });

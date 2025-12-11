@@ -1,15 +1,17 @@
 # ASDF Validator
 
-Real-time fee tracking for Pump.fun token creators with cryptographic Proof-of-History.
+Real-time fee tracking for Pump.fun token creators. Yes, another crypto tool. No, we're not sorry.
 
-## Features
+## What does it do?
 
-- **Real-time tracking** via WebSocket (~400ms latency)
-- **Per-token attribution** - know which token generated each fee
-- **Auto-discovery** of all tokens from a creator wallet
-- **Proof-of-History** - SHA-256 chain for verifiable fee records
-- **Web Dashboard** - real-time visualization of fees
-- **Dual vault monitoring** - Bonding Curve + AMM (PumpSwap)
+It watches your Pump.fun fees in real-time. That's it. That's the whole thing.
+
+- **Real-time tracking** - WebSocket magic, ~400ms latency (faster than your regrets)
+- **Per-token attribution** - know exactly which token made you money (or didn't)
+- **Auto-discovery** - finds all your tokens automatically because we're not savages
+- **Proof-of-History** - SHA-256 chain, sounds fancy, works great
+- **Web Dashboard** - pretty charts for pretty people
+- **Dual vault monitoring** - Bonding Curve + AMM, because one vault is never enough
 
 ## Installation
 
@@ -18,34 +20,35 @@ npm install
 npm run build
 ```
 
-## Quick Start
+Congrats, you did it.
+
+## Usage
 
 ### CLI Daemon
 
 ```bash
-# Run daemon for your creator address
+# Basic usage
 npx ts-node cli.ts --creator YOUR_CREATOR_ADDRESS
 
-# With Proof-of-History enabled
+# With Proof-of-History (for the paranoid)
 npx ts-node cli.ts -c YOUR_ADDRESS -H history.json -v
 
-# Verify a history file
+# Verify a history file (trust but verify, right?)
 npx ts-node cli.ts --verify history.json
 
-# Custom RPC
+# Custom RPC (if you're fancy like that)
 npx ts-node cli.ts -c YOUR_ADDRESS -r https://my-rpc.com
 ```
 
 ### Web Dashboard
 
 ```bash
-# Start the dashboard
 npx ts-node dashboard/server.ts YOUR_CREATOR_ADDRESS [RPC_URL] [PORT]
 
 # Example
 npx ts-node dashboard/server.ts 5zwN9NQei4fctQ8AfEk67PVoH1jSCSYCpfYkeamkpznj
 
-# Open http://localhost:3000
+# Open http://localhost:3000 and enjoy the vibes
 ```
 
 ## Architecture
@@ -74,6 +77,8 @@ npx ts-node dashboard/server.ts 5zwN9NQei4fctQ8AfEk67PVoH1jSCSYCpfYkeamkpznj
    └──────────┘   └───────────┘   └─────────────┘
 ```
 
+It's boxes and arrows. It works. Don't overthink it.
+
 ## Project Structure
 
 ```
@@ -91,51 +96,40 @@ asdf-validator/
 │   └── utils.ts           # Types, constants, utilities
 ├── dashboard/
 │   ├── server.ts          # Dashboard Express server
-│   └── public/
-│       ├── index.html     # Dashboard UI
-│       ├── app.js         # Frontend logic
-│       └── style.css      # Styles
-├── tests/                 # Jest test suite
-├── package.json
-├── tsconfig.json
-└── README.md
+│   └── public/            # Frontend stuff
+├── tests/                 # We have tests. They pass. Mostly.
+└── README.md              # You are here
 ```
 
 ## How It Works
 
 ### Fee Detection
 
-1. **WebSocket subscription** to creator vault accounts (BC + AMM)
-2. **Balance change** detected in real-time
-3. **Transaction fetch** to find the token mint
-4. **Attribution** to specific token or marked as "orphan"
-5. **PoH record** with SHA-256 chain linking
+1. WebSocket subscription to vault accounts
+2. Balance changes? We see them. In real-time.
+3. Fetch the transaction, find the token
+4. Attribute the fee (or mark it as orphan, life is unfair)
+5. Record it with PoH because blockchain means trust no one
 
 ### Token Attribution Flow
 
 ```
 Vault balance change detected
          ↓
-Fetch recent transaction at slot
+Fetch transaction at slot
          ↓
-Parse preTokenBalances / postTokenBalances
+Parse token balances (before/after)
          ↓
-Extract token mint (not WSOL)
+Extract token mint (skip WSOL, obviously)
          ↓
-Match to tracked token or discover new
+Match to tracked token or discover new one
          ↓
-Update per-token stats
-         ↓
-Emit FeeRecord with mint & symbol
+Update stats, emit record, move on with life
 ```
 
 ### Proof-of-History
 
-Each fee event is recorded with:
-- SHA-256 hash of entry data
-- Link to previous entry hash
-- Sequence number for ordering
-- Timestamp and slot for verification
+Each fee event is chained with SHA-256. Tamper with one record and the whole chain screams at you.
 
 ```json
 {
@@ -168,6 +162,7 @@ const daemon = new ValidatorDaemon({
 });
 
 await daemon.start();
+// It's running. Go touch grass.
 ```
 
 ### RealtimeTracker
@@ -194,16 +189,15 @@ await tracker.start();
 RPC_URL=https://api.mainnet-beta.solana.com
 ```
 
+Keep your secrets secret. We don't log API keys because we're not monsters.
+
 ## Testing
 
 ```bash
-# Run all tests
-npm test
-
-# Run with coverage
-npm run test:coverage
+npm test           # Run tests
+npm run test:coverage  # Run with coverage (for the completionists)
 ```
 
 ## License
 
-MIT
+MIT - Do whatever you want. This is fine.
